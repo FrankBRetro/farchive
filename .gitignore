@@ -1,0 +1,7 @@
+# object files and host test programs
+build/
+test/arctest
+*.o
+# editor / Finder leftovers
+*.bak
+.DS_Store
