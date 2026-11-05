@@ -31,7 +31,7 @@
 
 #undef APPNAME
 #define APPNAME "FArchive"
-#define FA_VERSION "1.0"
+#define FA_VERSION "1.6.1"          /* as the binaries say */
 
 #ifndef VA_START
 #define VA_START      0x4711

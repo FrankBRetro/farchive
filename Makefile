@@ -12,7 +12,8 @@
 # CPU variants, each with FARCHIVE.PRG and its worker FAWORK.TTP - copy
 # both of one build into the same folder:
 #   000      68000, runs on every Atari          -> release/, log/
-#   030      68030 code (TT, Falcon)             -> release/030/, log/030/
+#   030      68030 code, no FPU (TT, Falcon)     -> release/030/, log/030/
+#   030fpu   68030 + 68881/68882 FPU code        -> release/030fpu/, log/030fpu/
 #   040      68040                               -> release/040/, log/040/
 #   cf       ColdFire V4e (FireBee)              -> release/cf/, log/cf/
 # Log builds write FARCHIVE.LOG next to the program.
@@ -24,13 +25,15 @@ CFLAGS  ?= -O2 -fomit-frame-pointer
 CFLAGS  += -Wall -Wno-pointer-sign
 LDLIBS   = -lgem
 
-VARIANTS ?= 000 030 040 cf
+VARIANTS ?= 000 030 030fpu 040 cf
 FLAGS_000 = -m68000
-FLAGS_030 = -m68030
+FLAGS_030 = -m68030 -msoft-float
+FLAGS_030fpu = -m68030 -m68881
 FLAGS_040 = -m68040
 FLAGS_cf  = -mcpu=5475
 DIR_000   =
 DIR_030   = /030
+DIR_030fpu = /030fpu
 DIR_040   = /040
 DIR_cf    = /cf
 

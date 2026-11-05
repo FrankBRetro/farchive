@@ -1,4 +1,4 @@
-# FArchive 1.0 — GEM archiver for TOS, MultiTOS and MiNT
+# FArchive 1.6.1 — GEM archiver for TOS, MultiTOS and MiNT
 
 `farchive.prg` extracts and makes archives in **ZIP, LHA (.LZH), ZOO, ARC,
 LZX, TAR, TAR.GZ (.TGZ) and GZ**. It works like FConv: it starts as an
@@ -60,14 +60,15 @@ or the ELF toolchain with `make CROSS=m68k-atari-mintelf-`):
 ```
 make                    # release and log builds for every CPU
 make release            # release builds only
-make VARIANTS=000       # only the 68000 builds (or 030, 040, cf)
+make VARIANTS=000       # only the 68000 builds (or 030, 030fpu, 040, cf)
 make arctest            # host test tool for the archive layer (native gcc)
 ```
 
 | Build | Folder | Runs on |
 |---|---|---|
 | 68000 | `release/`, `log/` | every Atari |
-| 68030 | `release/030/`, `log/030/` | TT, Falcon, 68030 accelerators |
+| 68030 | `release/030/`, `log/030/` | TT, Falcon, 68030 accelerators (no FPU needed) |
+| 68030 + 68882 | `release/030fpu/`, `log/030fpu/` | the same with an FPU (FArchive does no floating point, so this is the 030 build again) |
 | 68040 | `release/040/`, `log/040/` | 68040 machines and accelerators |
 | ColdFire | `release/cf/`, `log/cf/` | FireBee |
 
@@ -106,6 +107,8 @@ only) and adds (`a ARCHIVE FMT FILES...`) on the host.
   corrupted archives. ARC's old methods 5–7 have no test files.
 - **Type-checked for the 68000, 68030 and 68040** against the real mintlib
   and gemlib headers.
+- The binaries in `release/` and `log/` were built with the MiNT cross
+  toolchain from this source.
 - **Not yet run on TOS/MiNT**: the GUI, the worker and `Dpathconf` on real
   drives are worth watching on first runs.
 
