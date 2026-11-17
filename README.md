@@ -1,4 +1,4 @@
-# FArchive 1.6.1 — GEM archiver for TOS, MultiTOS and MiNT
+# FArchive 1.7.0 — GEM archiver for TOS, MultiTOS, MiNT and PC GEM
 
 `farchive.prg` extracts and makes archives in **ZIP, LHA (.LZH), ZOO, ARC,
 LZX, TAR, TAR.GZ (.TGZ) and GZ**. It works like FConv: it starts as an
@@ -12,20 +12,69 @@ runs in its own `fawork.ttp` at nice 19; on TOS it runs inside FArchive.
   folder (each into a folder of its own with *Folder per archive*), or —
   with *Options › Extract dropped archives* off — to open each in a window.
 - **Drop other files or folders on the icon** to pack them into a new
-  archive: FArchive asks for its name (the extension says the format; the
-  *Format* menu gives the one for new archives).
+  archive: FArchive asks for its format (with *Best compression*, set to
+  the last ones used), then for its name. *File › New archive...* asks the
+  same way. An archive that is opened or extracted is read as what its
+  contents show, whatever its extension; its window's info line shows the
+  format, and files added to it go in that format.
 - **Archive windows** (*File › Open archive...*, or *New archive...* for an
   empty one) list the members with size, packed size, method and date.
   Click to select, Shift-click to add or take away one, Control-click for
-  everything from the last click; *File › Extract selected* (^X, nothing
-  selected = all) or double-click a member to extract it. **Files and
+  everything from the last click; the cursor keys move the selection and
+  Shift with them selects from where it started (also Page Up/Down, Home,
+  End); *Edit › Select all* (^S) and *Select none* (^Z).
+  *Archive › Extract selected* (^T) extracts
+  just the selected members and *Archive › Extract all* (^Y) the whole
+  archive; double-click a member to extract just that one. *Archive ›
+  Find...* (^F) selects every member whose path contains the name typed
+  (or, with `*` and `?`, has a file or folder name that matches) and shows
+  the first; *Find next* (^G) goes on to the next one. *Archive › Check
+  8.3 names* (^K) tells whether the archive is safe to extract on TOS as it
+  is: members whose names (or folders) aren't valid 8.3 names are selected
+  and listed in a window of their own (and in the log).
+- **Copy between archives**: drag selected members from one archive window
+  to another; they are extracted to a temporary folder next to FArchive and
+  added to the other archive in its own format (two tasks, with progress).
+  *Edit › Copy* (^C) or *Cut* (^X) the selected members, then *Paste* (^V)
+  in another archive window does the same; after a Cut they are deleted
+  from the first archive once they are safely in the second.
+- **Rename**: *Edit › Rename...* (^R) shows the selected member's path;
+  change its file name, or the name of any one folder on the way (that
+  folder and everything in it is renamed). Handy for
+  making an archive TOS safe before extracting it (see *Check 8.3
+  names*). The members are extracted to a temporary folder and added again
+  under the new name, the old ones taken out in the same rewrite.
+- **Fix 8.3 names**: *Archive › Fix 8.3 names...* (^J) gives every file
+  and folder whose name isn't a valid 8.3 name (or would clash with
+  another once TOS makes them capitals) one, `Long File Name.txt` →
+  `LONGFI_1.TXT`, in the archive itself, so it extracts anywhere as it
+  is. The new names are listed in the log and it always asks first. Like
+  Rename, the archive is only rewritten if every file came out and went
+  back in; empty folders keep their names. Not for ARC (8.3 already) or
+  GZ.
+- **Filter**: *Archive › Filter...* (^L) lists only the files whose names
+  match, e.g. `*.jpg` or `*.jpg;*.png` (folders are hidden while a filter
+  is on; the info line shows it). Select all, Find and the cursor keys
+  work on what is shown; *Show all* takes the filter away.
+- **Delete**: *Edit › Delete...* (Delete key) takes the selected members
+  (and everything in a selected folder) out of the archive, which is
+  written again without them. Not for GZ files (one file each), nor
+  members merged into an LZX group.
+- **Confirm changes** (*Options*, on by default): copying, moving and
+  deleting members ask first, in an alert window that doesn't stop
+  anything else; so does adding anything that would replace members
+  already in the archive (*Replace*, *Keep old* or *Cancel*).
+- **Skip Mac files** (*Options*, on by default): `.DS_Store`, the 4 KB
+  `._name` files and the `__MACOSX` folder that macOS puts in archives are
+  left out when extracting and when adding. Without a
+  destination folder set, FArchive asks for one first. **Files and
   folders dropped on an archive window are added to it**, as is what
-  *File › Add files...* picks (no name in the file selector = the folder).
+  *Archive › Add files...* picks (no name in the file selector = the folder).
   Members of the same name are replaced when *Replace existing files* is on.
 - **8.3 names**: extracting to a FAT drive (TOS, or MiNT's FAT file
   systems — checked per drive with `Dpathconf`), member and folder names
   that are not valid 8.3 names are renamed (`Long File Name.txt` →
-  `LONGFI~1.TXT`, clashes get `~2`, `~3`...) and each rename is listed in
+  `LONGFI_1.TXT`, clashes get `_2`, `_3`...; no `~`, which TOS doesn't take) and each rename is listed in
   the log. Drives with long names (ext2, MinixFS...) get the names as they
   are. *Options › 8.3 names on FAT drives* switches this off.
 - Paths in archives are made safe: drive letters and `..` are dropped.
@@ -36,7 +85,11 @@ runs in its own `fawork.ttp` at nice 19; on TOS it runs inside FArchive.
   `FARCHIVE.TXT` in the destination folder — **only on a hard disk**: when
   the destination is on A: or B: it goes next to the program instead, and
   when that is a floppy too, no log file is written.
-- Settings are kept in `FARCHIVE.INF` next to the program.
+- Settings are kept in `FARCHIVE.INF` next to the program. Menus and
+  dialogs are in the resource file `farchive.rsc`, which goes next to the
+  program (`make rsc` builds it from `rsc/lang/en.txt`). About, the new
+  archive's format and Find are windows of their own, so nothing waits for
+  them.
 
 | Format | Reads | Writes |
 |---|---|---|
@@ -51,6 +104,15 @@ runs in its own `fawork.ttp` at nice 19; on TOS it runs inside FArchive.
 A GZ file holds a single file; use TAR.GZ for more. Adding to an archive
 writes a new one next to it (`FARC$$$$.TMP`) and then replaces it, so
 there must be room for both.
+
+## PC GEM
+
+`pcgem/FARCHIVE.APP` is FArchive for PC GEM (FreeGEM / OpenGEM on DOS): a
+32-bit DJGPP program with its own copy of the PC GEM layer (`pcgem/`),
+the same sources and the same resource file as on the Atari. Install it
+in a folder of its own (e.g. `C:\FARCHIVE`) with `FARCHIVE.RSC` and
+`CWSDPMI.EXE`. On PC GEM everything runs in FArchive itself (no
+background worker), and long file names are used where DOS has them.
 
 ## Building
 

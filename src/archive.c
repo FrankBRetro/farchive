@@ -76,6 +76,15 @@ static int lc_eq(const char *a, const char *b)
     return tolower((u8)*a) == tolower((u8)*b);
 }
 
+/* the first n characters the same, case aside: 0 */
+static int lc_ncmp(const char *a, const char *b, size_t n)
+{
+    for (; n; n--, a++, b++)
+        if (toupper((u8)*a) != toupper((u8)*b))
+            return 1;
+    return 0;
+}
+
 static int ext_is(const char *path, const char *ext)
 {
     size_t n = strlen(path), m = strlen(ext);
@@ -84,13 +93,16 @@ static int ext_is(const char *path, const char *ext)
 
 /* ---------------------------------------------------------- 8.3 names */
 
+/* characters every TOS (and GEMDOS on a FAT disk) takes in a short
+   name: no ~ (Windows' long-name tails upset TOS), ` { } or anything
+   past 127, which reads differently on every system                 */
 static int ok83char(int c)
 {
     if (c >= 128)
-        return 1;
+        return 0;
     if (isalnum(c))
         return 1;
-    return c && strchr("!#$%&'()-@^_`{}~", c) != 0;
+    return c && strchr("!#$%&'()-@^_", c) != 0;
 }
 
 /* is s (one path part) a valid 8.3 name? */
@@ -114,7 +126,32 @@ static int valid83(const char *s)
     return base >= 1 && base <= 8 && ext != 0 && ext <= 3;
 }
 
-/* 8.3 form of a name with an optional ~n tail (n > 0) */
+int af_valid83(const char *part) { return valid83(part); }
+
+static void make83(const char *name, char *out, int upper, int n);
+
+void af_make83(const char *part, char *out, int n) { make83(part, out, 1, n); }
+
+/* any part of the path is one of macOS's own files: .DS_Store, an
+   AppleDouble ._name (the resource fork and Finder data, 4 KB each), or
+   the __MACOSX folder the Finder's zip puts them in */
+int af_mac_meta(const char *path)
+{
+    const char *p = path, *e;
+    while (*p) {
+        size_t n;
+        for (e = p; *e && *e != '/' && *e != '\\'; e++) ;
+        n = (size_t)(e - p);
+        if ((n == 9 && !strncmp(p, ".DS_Store", 9)) || (n >= 2 && p[0] == '.' && p[1] == '_') ||
+            (n == 8 && !strncmp(p, "__MACOSX", 8)))
+            return 1;
+        p = *e ? e + 1 : e;
+    }
+    return 0;
+}
+
+/* 8.3 form of a name with an optional _n tail (n > 0): _ and not
+   Windows' ~, which TOS doesn't take */
 static void make83(const char *name, char *out, int upper, int n)
 {
     char base[64], ext[4], tail[16];
@@ -144,7 +181,7 @@ static void make83(const char *name, char *out, int upper, int n)
     if (n == 0 && nb > 8)
         n = 1;
     if (n > 0) {
-        sprintf(tail, "~%d", n);
+        sprintf(tail, "_%d", n);
         room = 8 - (int)strlen(tail);
         if (nb > room)
             nb = room;
@@ -606,13 +643,16 @@ static int gz_list(ARCH *a, FILE *f)
 
 /* ============================================================== open */
 
-int arch_open(ARCH *a, const char *path)
+int arch_open(ARCH *a, const char *path) { return arch_open_as(a, path, AF_NONE); }
+
+/* fmt AF_NONE: the format from the contents; else read it as that one */
+int arch_open_as(ARCH *a, const char *path, int fmt)
 {
     FILE *f;
     int e;
     memset(a, 0, sizeof *a);
     strncpy(a->path, path, sizeof a->path - 1);
-    a->fmt = af_detect(path);
+    a->fmt = fmt > AF_NONE && fmt < AF_COUNT ? fmt : af_detect(path);
     if (a->fmt == AF_NONE) {
         f = fopen(path, "rb");
         if (!f)
@@ -852,6 +892,13 @@ static int x_open(XCTX *x, AENT *e)
         x->o->nskip++;
         return 0;
     }
+    if (x->o->nomac && af_mac_meta(e->name)) {
+        if (!e->dir) {
+            ar_log(x->o, "Skipped %s (Mac file)", e->name);
+            x->o->nskip++;
+        }
+        return 0;
+    }
     r = dest_path(x, e, x->opath);
     if (r < 0) {
         x->o->nfail++;
@@ -871,6 +918,15 @@ static int x_open(XCTX *x, AENT *e)
         return 0;
     }
     made_add(x, x->opath);
+    if (x->o->mapw) {                  /* copying: where it went, what it was */
+        char rel[300], *p;
+        size_t n = strlen(x->dest);
+        strcpy(rel, strncmp(x->opath, x->dest, n) ? x->opath : x->opath + n);
+        for (p = rel; *p; p++)
+            if (*p == '\\')
+                *p = '/';
+        fprintf(x->o->mapw, "%s\t%s\n", rel, e->name);
+    }
     x->crc32 = 0xFFFFFFFFUL;
     x->crc16 = 0;
     x->got = 0;
@@ -1536,9 +1592,90 @@ typedef struct {
     const char *self;                  /* the archive: never into itself */
 } ILIST;
 
+/* copying between archives: the names FAT shortened, back to the ones
+   the members had (read from the map file the extracting wrote) */
+static char **map_file, **map_orig;
+static int map_n;
+
+static void map_free(void);
+
+static void map_load(const char *path)
+{
+    FILE *f = path ? fopen(path, "r") : 0;
+    char line[600];
+    int cap = 0;
+    map_free();
+    while (f && fgets(line, sizeof line, f)) {
+        char *tab = strchr(line, '\t');
+        line[strcspn(line, "\r\n")] = 0;
+        if (!tab)
+            continue;
+        *tab++ = 0;
+        if (map_n == cap) {
+            cap = cap ? cap * 2 : 64;
+            map_file = realloc(map_file, cap * sizeof(char *));
+            map_orig = realloc(map_orig, cap * sizeof(char *));
+            if (!map_file || !map_orig)
+                break;
+        }
+        map_file[map_n] = strdup(line);
+        map_orig[map_n] = strdup(tab);
+        if (map_file[map_n] && map_orig[map_n])
+            map_n++;
+    }
+    if (f)
+        fclose(f);
+}
+
+static void map_free(void)
+{
+    int i;
+    for (i = 0; i < map_n; i++) {
+        free(map_file[i]);
+        free(map_orig[i]);
+    }
+    free(map_file); free(map_orig);
+    map_file = map_orig = 0;
+    map_n = 0;
+}
+
+static const char *map_name(const char *name)
+{
+    static char folder[300];
+    int i;
+    for (i = 0; i < map_n; i++) {
+        const char *a = map_file[i], *b = name;
+        while (*a && *b && toupper((u8)*a) == toupper((u8)*b))
+            a++, b++;
+        if (!*a && !*b)
+            return map_orig[i];
+        /* a folder on a file's way: as many parts of the original path */
+        if (!*b && *a == '/') {
+            const char *p = name, *o = map_orig[i];
+            int parts = 1;
+            size_t n;
+            for (; *p; p++)
+                if (*p == '/')
+                    parts++;
+            for (p = o; *p && parts; p++)
+                if (*p == '/' && !--parts)
+                    break;
+            n = (size_t)(p - o);
+            if (!parts && n < sizeof folder) {
+                memcpy(folder, o, n);
+                folder[n] = 0;
+                return folder;
+            }
+        }
+    }
+    return name;
+}
+
 static int il_push(ILIST *l, const char *path, const char *name, int dir, long size, u32 dt)
 {
     AITEM *t;
+    if (map_n)
+        name = map_name(name);
     if (l->n == l->cap) {
         int nc = l->cap ? l->cap * 2 : 64;
         AITEM *ni = realloc(l->it, nc * sizeof(AITEM));
@@ -1573,6 +1710,11 @@ static int walk_fn(void *ctx, const char *nm)
     u32 dt;
     int isdir;
     join(p, w->dir, nm);
+    if (w->l->o->nomac && af_mac_meta(nm)) {
+        ar_log(w->l->o, "Left out %s (Mac file)", p);
+        w->l->o->nskip++;
+        return 0;
+    }
     if (strlen(p) > 250 || strlen(w->name) + strlen(nm) > 250) {
         ar_log(w->l->o, "Path too long, skipped: %.200s", p);
         w->l->o->nskip++;
@@ -1651,6 +1793,7 @@ int arch_add(const char *path, int fmt, char **files, int nfiles, AOPT *o)
     memset(&w, 0, sizeof w);
     l.o = o;
     l.self = path;
+    map_load(o->mapr);
     /* what is there already */
     if (afs_isdir(path) == 0) {
         err = arch_open(&old, path);
@@ -1687,6 +1830,11 @@ int arch_add(const char *path, int fmt, char **files, int nfiles, AOPT *o)
             nm[--n] = 0;
         if (same_file(fp, path))
             continue;                  /* not into itself */
+        if (o->nomac && af_mac_meta(nm)) {
+            ar_log(o, "Left out %s (Mac file)", fp);
+            o->nskip++;
+            continue;
+        }
         if (afs_info(fp, &size, &dt, &isdir) != E_OK) {
             ar_log(o, "Cannot find %s", fp);
             o->nfail++;
@@ -1699,6 +1847,11 @@ int arch_add(const char *path, int fmt, char **files, int nfiles, AOPT *o)
     }
     if (err)
         goto out;
+    if (fmt == AF_GZ && o->ndel) {
+        ar_log(o, "A GZ file holds one file: nothing can be deleted from it");
+        err = E_UNSUP;
+        goto out;
+    }
     if (fmt == AF_GZ) {
         int nf = 0;
         for (i = 0; i < l.n; i++)
@@ -1720,7 +1873,7 @@ int arch_add(const char *path, int fmt, char **files, int nfiles, AOPT *o)
     /* replacing old members */
     if (have_old) {
         keep = malloc(old.n + 1);
-        drop = malloc((l.n + 1) * sizeof(char *));
+        drop = malloc((l.n + old.n + 1) * sizeof(char *));
         if (!keep || !drop) {
             err = E_NOMEM;
             goto out;
@@ -1762,6 +1915,32 @@ int arch_add(const char *path, int fmt, char **files, int nfiles, AOPT *o)
             if (found == 1)
                 drop[ndrop++] = l.it[i].name;
         }
+        /* deleting: the members named (a folder: and all in it) are left out */
+        for (k = 0; k < old.n; k++) {
+            int d;
+            for (d = 0; d < o->ndel; d++) {
+                const char *dn = o->del[d], *on = old.e[k].name;
+                size_t n = strlen(dn);
+                while (n && dn[n - 1] == '/')
+                    n--;
+                if (!(lc_eq(on, dn) || (strlen(on) > n && on[n] == '/' && !lc_ncmp(on, dn, n))))
+                    continue;
+                if (old.e[k].group) {
+                    ar_log(o, "%s is in a merged LZX group: not deleted", on);
+                    o->nskip++;
+                } else if (keep[k]) {
+                    keep[k] = 0;
+                    drop[ndrop++] = old.e[k].name;
+                    ar_log(o, "Deleted %s", on);
+                    o->nok++;
+                }
+                break;
+            }
+        }
+    } else if (o->ndel) {
+        ar_log(o, "%s: nothing to delete from", ar_base(path));
+        err = E_OPEN;
+        goto out;
     }
     for (i = 0; i < l.n; i++)
         if (l.it[i].path[0])
@@ -1966,6 +2145,12 @@ int arch_add(const char *path, int fmt, char **files, int nfiles, AOPT *o)
         case AF_GZ: err = gz_end(&w); break;
         }
     }
+    /* a rename (new names in, the old ones out in the same rewrite): if
+       any file couldn't be added, the archive stays as it was        */
+    if (!err && o->ndel && nfiles && o->nfail) {
+        ar_log(o, "Not all of them could be added: %s is left as it was", ar_base(path));
+        err = E_OPEN;
+    }
     if (!err && w.hiwater > aw_tell(&w))
         afs_truncate(w.f, aw_tell(&w));
 fail:
@@ -1997,6 +2182,7 @@ fail:
             remove(bak);
     }
 out:
+    map_free();
     arch_close(&old);
     arch_close(&w.out);
     free(l.it);

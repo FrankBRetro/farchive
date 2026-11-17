@@ -18,6 +18,9 @@
 #include <mint/mintbind.h>
 #include <fcntl.h>
 #endif
+#ifdef PCGEM
+#include <fcntl.h>                      /* _use_lfn */
+#endif
 
 int afs_long_names(const char *dir)
 {
@@ -37,6 +40,10 @@ int afs_long_names(const char *dir)
     if (trunc == 2)                    /* DP_DOSTRUNC: 8.3 */
         return 0;
     return nmax > 12;
+#elif defined(PCGEM)
+    /* DOS: long names only with a long file name driver (DOSBox-X's own,
+       DOSLFN...), as DJGPP's library finds; otherwise 8.3 */
+    return _use_lfn(dir && *dir ? dir : ".") != 0;
 #else
 #ifdef ARC_TEST
     extern int force_fat;
@@ -130,6 +137,32 @@ int afs_truncate(FILE *f, long len)
 int afs_rename(const char *from, const char *to)
 {
     return rename(from, to) == 0 ? E_OK : E_WRITE;
+}
+
+/* remove a folder and everything in it (FArchive's own temporary ones) */
+int afs_rmtree(const char *dir)
+{
+    char p[300], b[300];
+    DIR *d;
+    struct dirent *de;
+    struct stat st;
+    const char *base = bare(dir, b);
+    d = opendir(base);
+    if (!d)
+        return E_OPEN;
+    while ((de = readdir(d)) != 0) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        if (strlen(base) + strlen(de->d_name) + 2 >= sizeof p)
+            continue;
+        sprintf(p, "%s\\%s", base, de->d_name);
+        if (stat(p, &st) == 0 && S_ISDIR(st.st_mode))
+            afs_rmtree(p);
+        else
+            remove(p);
+    }
+    closedir(d);
+    return rmdir(base) == 0 ? E_OK : E_WRITE;
 }
 
 int afs_scandir(const char *dir, int (*fn)(void *ctx, const char *name), void *ctx)

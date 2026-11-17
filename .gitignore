@@ -5,3 +5,4 @@ test/arctest
 # editor / Finder leftovers
 *.bak
 .DS_Store
+_to_delete/

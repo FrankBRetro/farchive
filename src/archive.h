@@ -56,12 +56,23 @@ typedef struct {
     int    subdirs;                    /* recurse into folders (adding)      */
     int    paths;                      /* keep folders (extracting)          */
     int    level;                      /* 1 fast .. 3 best                   */
+    int    nomac;                      /* leave out Mac files (.DS_Store ...) */
+    FILE  *mapw;                       /* extracting: "file\toriginal" lines   */
+    const char *mapr;                  /* adding: names back from such a file  */
+    char **del;                        /* members to leave out (deleting); a  */
+    int    ndel;                       /* folder's name takes what is in it   */
     PROG  *pg;
     /* results */
     int    nok, nfail, nskip, nren;
 } AOPT;
 
 int  arch_open(ARCH *a, const char *path);     /* list the members */
+/* macOS's own files: .DS_Store, ._name (resource forks), __MACOSX/ */
+int  af_mac_meta(const char *path);
+/* is one path part a valid 8.3 (TOS / FAT) name? */
+int  af_valid83(const char *part);
+void af_make83(const char *part, char *out, int n);   /* n > 0: _n tail */
+int  arch_open_as(ARCH *a, const char *path, int fmt);  /* ... read as fmt (AF_NONE: detect) */
 void arch_close(ARCH *a);
 /* extract the members with sel[i] set (sel 0: all) into dest */
 int  arch_extract(ARCH *a, const char *dest, const u8 *sel, AOPT *o);
@@ -85,6 +96,7 @@ int  afs_truncate(FILE *f, long len);  /* E_UNSUP where it cannot          */
 int  afs_rename(const char *from, const char *to);
 /* list a folder: calls fn for each name (not . or ..) until it returns 1 */
 int  afs_scandir(const char *dir, int (*fn)(void *ctx, const char *name), void *ctx);
+int  afs_rmtree(const char *dir);        /* a folder and all in it */
 
 /* time helpers */
 u32  dos_from_unix(long t);

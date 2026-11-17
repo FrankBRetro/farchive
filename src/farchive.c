@@ -22,12 +22,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <time.h>
 #include <osbind.h>
 #include <mintbind.h>
 #include <mint/cookie.h>
 #include "gemui.h"
 #include "archive.h"
+#include "wdlg.h"
+#include "farsc.h"             /* the resource file's trees (rsc/mkrsc.py) */
 
 #undef APPNAME
 #define APPNAME "FArchive"
@@ -77,7 +80,8 @@ GRECT desk;
 PREFS prefs;
 DISPINFO dinfo;
 int  quitting;
-int  aes_iconify, aes_3d;
+int  aes_iconify, aes_3d, aes_xbutton;
+static int bg3d = -1;    /* the AES's 3D grey (objc_sysvar BACKGRCOL), -1: none */   /* aes_xbutton: wdlg.c (check boxes) */
 extern const char *job_app_name, *job_log_name, *job_worker_name;
 
 /* ------------------------------------------------------------ settings */
@@ -91,25 +95,17 @@ typedef struct {
     int  subdirs;                /* adding folders: include subfolders   */
     int  rename83;               /* 8.3 names on FAT drives              */
     int  best;                   /* best (slower) compression            */
+    int  nomac;                  /* leave out .DS_Store, ._name, __MACOSX */
+    int  confirm;                /* ask before copying a drag's members  */
     char dest[256];              /* destination folder, ends in '\'      */
 } ASET;
 
-static ASET cs = { AF_ZIP, 1, 1, 1, 0, 1, 1, 0, "" };
+static ASET cs = { AF_ZIP, 1, 1, 1, 0, 1, 1, 0, 1, 1, "" };
 static char app_folder[256];
 
 long now_ms(void)
 {
     return (long)(clock() * 1000L / CLOCKS_PER_SEC);
-}
-
-void alertf(const char *fmt, ...)
-{
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    form_alert(1, buf);
 }
 
 static int fa_file_select(char *path, char *name, const char *title)
@@ -155,9 +151,9 @@ static void settings_save(void)
     if (!f)
         return;
     fprintf(f, "FARCHIVE 1\nformat=%d\nextract=%d\nfolder=%d\npaths=%d\nreplace=%d\n"
-            "subfolders=%d\nrename83=%d\nbest=%d\ndest=%s\n",
+            "subfolders=%d\nrename83=%d\nbest=%d\nnomac=%d\nconfirm=%d\ndest=%s\n",
             cs.fmt, cs.xdrop, cs.folder, cs.paths, cs.replace, cs.subdirs, cs.rename83,
-            cs.best, cs.dest);
+            cs.best, cs.nomac, cs.confirm, cs.dest);
     fclose(f);
 }
 
@@ -185,6 +181,8 @@ static void settings_load(void)
         else if (!strcmp(line, "subfolders")) cs.subdirs = n != 0;
         else if (!strcmp(line, "rename83")) cs.rename83 = n != 0;
         else if (!strcmp(line, "best")) cs.best = n != 0;
+        else if (!strcmp(line, "nomac")) cs.nomac = n != 0;
+        else if (!strcmp(line, "confirm")) cs.confirm = n != 0;
         else if (!strcmp(line, "dest")) {
             strncpy(cs.dest, v, sizeof cs.dest - 2);
             cs.dest[sizeof cs.dest - 2] = 0;
@@ -193,132 +191,55 @@ static void settings_load(void)
     fclose(f);
 }
 
-/* ---------------------------------------------------------- object trees */
-
-static void obj_add(OBJECT *t, int idx, int parent, int type, int flags,
-                    int state, long spec, int x, int y, int w, int h)
-{
-    OBJECT *o = &t[idx];
-    o->ob_next = o->ob_head = o->ob_tail = -1;
-    o->ob_type = type;
-    o->ob_flags = flags;
-    o->ob_state = state;
-    o->ob_spec.index = spec;
-    o->ob_x = x; o->ob_y = y; o->ob_width = w; o->ob_height = h;
-    if (parent >= 0) {
-        OBJECT *p = &t[parent];
-        if (p->ob_head < 0)
-            p->ob_head = idx;
-        else
-            t[p->ob_tail].ob_next = idx;
-        p->ob_tail = idx;
-        o->ob_next = parent;
-    }
-}
 
 /* ----------------------------------------------------------------- menu */
 
-#define NTITLE 4
-static const char *titles[NTITLE] = { " FArchive ", " File ", " Format ", " Options " };
-static const char *m_desk[] = {
-    "  About FArchive...  ", "---------------------",
-    "  Desk Accessory 1   ", "  Desk Accessory 2   ", "  Desk Accessory 3   ",
-    "  Desk Accessory 4   ", "  Desk Accessory 5   ", "  Desk Accessory 6   "
-};
-static const char *m_file[] = {
-    "  Open archive...        ^O ", "  New archive...         ^N ",
-    "----------------------------",
-    "  Extract archive...     ^E ", "  Extract selected       ^X ",
-    "  Add files...           ^A ", "  Select all             ^S ",
-    "  Close archive          ^U ",
-    "----------------------------",
-    "  Destination folder...  ^D ",
-    "----------------------------", "  Quit                   ^Q "
-};
-static const char *m_fmt[] = {
-    "  ZIP (deflate)        ", "  LHA (lh5)            ", "  ZOO (LZW)            ",
-    "  ARC (crunched)       ", "  LZX (Amiga)          ", "  TAR                  ",
-    "  TAR.GZ               ", "  GZ (one file)        ",
-    "-----------------------", "  Best compression     "
-};
-static const char *m_opt[] = {
-    "  Extract dropped archives ", "  Folder per archive       ",
-    "  Keep folders             ", "  Replace existing files   ",
-    "  Include subfolders       ", "  8.3 names on FAT drives  "
-};
-enum {                                       /* item numbers inside menus */
-    D_ABOUT = 0,
-    F_OPEN = 0, F_NEW = 1, F_EXTRACT = 3, F_XSEL, F_ADD, F_SELALL, F_CLOSE, F_DEST = 9,
-    F_QUIT = 11,
-    X_FIRST = 0, X_BEST = 9,
-    O_XDROP = 0, O_FOLDER, O_PATHS, O_REPLACE, O_SUBDIRS, O_83
-};
-static const char **m_lists[NTITLE] = { m_desk, m_file, m_fmt, m_opt };
-static const int m_counts[NTITLE] = { 8, 12, 10, 6 };
-#define MENU_OBJS (8 + 8 + 12 + 10 + 6 + NTITLE + 8)
-static OBJECT menu[MENU_OBJS];
-static int m_first[NTITLE];                  /* object of each menu's item 0 */
-
-static OBJECT *fa_build_menu(void)
-{
-    int i, idx, x, ncol = scr_w / (cell_w ? cell_w : 8), tx[NTITLE];
-    obj_add(menu, 0, -1, G_IBOX, 0, 0, 0L, 0, 0, ncol, 25);
-    obj_add(menu, 1, 0, G_BOX, 0, 0, 0x00001100L, 0, 0, ncol, 0x0201);
-    x = 0;
-    for (i = 0; i < NTITLE; i++) {
-        tx[i] = x;
-        x += (int)strlen(titles[i]);
-    }
-    obj_add(menu, 2, 1, G_IBOX, 0, 0, 0L, 2, 0, x, 0x0301);
-    for (i = 0; i < NTITLE; i++)
-        obj_add(menu, 3 + i, 2, G_TITLE, 0, 0, (long)titles[i], tx[i], 0,
-                (int)strlen(titles[i]), 0x0301);
-    obj_add(menu, 3 + NTITLE, 0, G_IBOX, 0, 0, 0L, 0, 0x0301, ncol, 19);
-    idx = 4 + NTITLE;
-    for (i = 0; i < NTITLE; i++) {
-        int k, w = 0, box = idx, bx = 2 + tx[i];
-        for (k = 0; k < m_counts[i]; k++)
-            if ((int)strlen(m_lists[i][k]) > w)
-                w = (int)strlen(m_lists[i][k]);
-        if (bx + w > ncol)
-            bx = ncol - w;
-        obj_add(menu, idx++, 3 + NTITLE, G_BOX, 0, 0, 0x00FF1100L, bx, 0, w, m_counts[i]);
-        m_first[i] = idx;
-        for (k = 0; k < m_counts[i]; k++) {
-            int sep = m_lists[i][k][0] == '-';
-            obj_add(menu, idx++, box, G_STRING, 0, sep ? DISABLED : 0,
-                    (long)m_lists[i][k], 0, k, w, 1);
-        }
-    }
-    menu[idx - 1].ob_flags |= LASTOB;
-    for (i = 0; i < idx; i++)
-        rsrc_obfix(menu, i);
-    menu[0].ob_width = scr_w;
-    menu[1].ob_width = scr_w;
-    return menu;
-}
-
-#define MI(m, k) (m_first[m] + (k))
+static OBJECT *menu;                         /* T_MENU of the resource file */
 
 static struct AWIN *top_awin(void);
+static int aw_can_extract(struct AWIN *w, int selected);
+static int aw_count_sel(struct AWIN *w);
+static int clip_has(void);
+static int aw_editable(struct AWIN *w, int how);
+static void add_files_ask(struct AWIN *to, char **names, int n);
+static void edit_copy(int cut);
+static void edit_paste(void);
+static void do_delete(void);
+static void do_rename(void);
+static int aw_filtered(struct AWIN *w);
+static void fix83(struct AWIN *w);
+static char find_pat[41];                   /* Archive > Find: what to look for */
 
 static void fa_menu_update(void)
 {
-    int i;
     struct AWIN *t = top_awin();
-    for (i = 0; i < AF_COUNT - 1; i++)
-        menu_icheck(menu, MI(2, X_FIRST + i), cs.fmt == i + 1);
-    menu_icheck(menu, MI(2, X_BEST), cs.best);
-    menu_icheck(menu, MI(3, O_XDROP), cs.xdrop);
-    menu_icheck(menu, MI(3, O_FOLDER), cs.folder);
-    menu_icheck(menu, MI(3, O_PATHS), cs.paths);
-    menu_icheck(menu, MI(3, O_REPLACE), cs.replace);
-    menu_icheck(menu, MI(3, O_SUBDIRS), cs.subdirs);
-    menu_icheck(menu, MI(3, O_83), cs.rename83);
-    menu_ienable(menu, MI(1, F_XSEL), t != 0);
-    menu_ienable(menu, MI(1, F_ADD), t != 0);
-    menu_ienable(menu, MI(1, F_SELALL), t != 0);
-    menu_ienable(menu, MI(1, F_CLOSE), t != 0);
+    menu_icheck(menu, MI_XDROP, cs.xdrop);
+    menu_icheck(menu, MI_FOLDER, cs.folder);
+    menu_icheck(menu, MI_PATHS, cs.paths);
+    menu_icheck(menu, MI_REPLACE, cs.replace);
+    menu_icheck(menu, MI_SUBDIRS, cs.subdirs);
+    menu_icheck(menu, MI_83, cs.rename83);
+    menu_icheck(menu, MI_NOMAC, cs.nomac);
+    menu_icheck(menu, MI_CONFIRM, cs.confirm);
+    menu_ienable(menu, MI_CHECK83, aw_can_extract(t, 0));
+    menu_ienable(menu, MI_FIX83, aw_can_extract(t, 0) && aw_editable(t, 0));
+    /* Archive: Extract selected only with something selected; Extract all
+       for any archive that has been read (not a new, empty one) */
+    menu_ienable(menu, MI_XSEL, aw_can_extract(t, 1));
+    menu_ienable(menu, MI_XALL, aw_can_extract(t, 0));
+    menu_ienable(menu, MI_FIND, aw_can_extract(t, 0));
+    menu_ienable(menu, MI_FILTER, aw_can_extract(t, 0));
+    menu_icheck(menu, MI_FILTER, aw_filtered(t));
+    menu_ienable(menu, MI_FNEXT, aw_can_extract(t, 0) && find_pat[0]);
+    menu_ienable(menu, MI_ADD, t != 0);
+    menu_ienable(menu, MI_SELALL, t != 0);
+    menu_ienable(menu, MI_SELNONE, t && aw_count_sel(t) > 0);
+    menu_ienable(menu, MI_CUT, aw_editable(t, 1));
+    menu_ienable(menu, MI_COPY, aw_editable(t, 1));
+    menu_ienable(menu, MI_PASTE, aw_editable(t, 0) && clip_has());
+    menu_ienable(menu, MI_DELETE, aw_editable(t, 2));
+    menu_ienable(menu, MI_RENAME, aw_editable(t, 2) && aw_count_sel(t) == 1);
+    menu_ienable(menu, MI_CLOSE, t != 0);
 }
 
 /* ------------------------------------------------------------- helpers */
@@ -480,6 +401,10 @@ typedef struct AWIN {
     long  usize, csize;
     long  top;
     int   anchor;                            /* last clicked row          */
+    int   cur;                               /* the cursor keys' row      */
+    int  *vis, *rowof, nv;                   /* rows shown: member indices,
+                                                each member's row (-1)    */
+    char  filt[41];                          /* Archive > Filter          */
     int   busy;                              /* a task is using it        */
     int   stale;                             /* read it again (cancelled) */
     long  serial;                            /* which window, for tasks   */
@@ -532,6 +457,10 @@ static void aw_free_list(AWIN *w)
     free(w->e);
     w->e = 0;
     w->n = 0;
+    free(w->vis);
+    free(w->rowof);
+    w->vis = w->rowof = 0;
+    w->nv = 0;
     w->usize = w->csize = 0;
 }
 
@@ -547,14 +476,14 @@ static int aw_rows(AWIN *w)
 static void aw_slider(AWIN *w)
 {
     int vis = aw_rows(w);
-    if (w->top > w->n - vis) w->top = w->n - vis;
+    if (w->top > w->nv - vis) w->top = w->nv - vis;
     if (w->top < 0) w->top = 0;
-    if (w->n <= vis) {
+    if (w->nv <= vis) {
         wind_set(w->handle, WF_VSLSIZE, 1000, 0, 0, 0);
         wind_set(w->handle, WF_VSLIDE, 0, 0, 0, 0);
     } else {
-        wind_set(w->handle, WF_VSLSIZE, (short)(1000L * vis / w->n), 0, 0, 0);
-        wind_set(w->handle, WF_VSLIDE, (short)(1000L * w->top / (w->n - vis)), 0, 0, 0);
+        wind_set(w->handle, WF_VSLSIZE, (short)(1000L * vis / w->nv), 0, 0, 0);
+        wind_set(w->handle, WF_VSLIDE, (short)(1000L * w->top / (w->nv - vis)), 0, 0, 0);
     }
 }
 
@@ -573,6 +502,8 @@ static void aw_set_info(AWIN *w)
         size_str(w->csize, b);
         sprintf(w->info, " %s, %d member%s, %s bytes, %s packed", af_name(w->fmt),
                 w->n, w->n == 1 ? "" : "s", a, b);
+        if (w->filt[0])
+            sprintf(w->info + strlen(w->info), ", %d shown (%s)", w->nv, w->filt);
         if (nsel)
             sprintf(w->info + strlen(w->info), ", %d selected", nsel);
     }
@@ -634,6 +565,19 @@ static void aw_draw(AWIN *w, GRECT *clip)
     if (namew < 12) namew = 12;
     x = wk.g_x + cell_w / 2;
     y = wk.g_y + 2;
+    if (bg3d >= 0) {                         /* the column titles on the AES's grey */
+        short hb[4];
+        hb[0] = wk.g_x; hb[1] = wk.g_y;
+        hb[2] = wk.g_x + wk.g_w - 1; hb[3] = y + cell_h;
+        vsf_color(vdih, bg3d);
+        vswr_mode(vdih, MD_REPLACE);
+        vr_recfl(vdih, hb);
+        hb[3] = hb[1];                       /* a white edge on top */
+        vsl_color(vdih, 0);
+        vsl_width(vdih, 1);
+        v_pline(vdih, 2, hb);
+        vswr_mode(vdih, MD_TRANS);
+    }
     vst_color(vdih, 1);
     vst_effects(vdih, 1);
     sprintf(line, "%-*.*s %6s %6s %-7s %s", namew, namew, "Name", "Size", "Packed",
@@ -650,13 +594,14 @@ static void aw_draw(AWIN *w, GRECT *clip)
     }
     y += cell_h + 4;
     vis = aw_rows(w);
-    if (!w->n) {
+    if (!w->n || !w->nv) {
         v_gtext(vdih, x, y, w->busy ? "(reading the archive...)" :
-                w->isnew ? "(empty: drop files on this window)" : "(no members)");
+                w->isnew ? "(empty: drop files on this window)" :
+                w->n ? "(nothing matches the filter)" : "(no members)");
         return;
     }
-    for (i = (int)w->top; i < w->n && i < w->top + vis + 1; i++) {
-        MEMB *e = &w->e[i];
+    for (i = (int)w->top; i < w->nv && i < w->top + vis + 1; i++) {
+        MEMB *e = &w->e[w->vis[i]];
         const char *nm = e->name;
         int l = (int)strlen(nm);
         char shown[260];
@@ -720,12 +665,72 @@ static void aw_changed(AWIN *w)
     aw_slider(w);
     aw_set_info(w);
     post_redraw_h(w->handle);
+    fa_menu_update();                        /* Extract selected follows the selection */
 }
 
 /* make the list from a job's listing blob */
 static u32 get4(const u8 *p)
 {
     return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3];
+}
+
+static int find_match(const char *name, const char *pat);
+
+/* is the member shown? Archive > Filter: one or more patterns (between
+   them ; , or spaces), matched against the file's name (* and ?; plain
+   text: anywhere in it). With a filter folders aren't listed.        */
+static int aw_shows(AWIN *w, MEMB *e)
+{
+    const char *p = w->filt, *b;
+    char pat[44];
+    if (!*p)
+        return 1;
+    if (e->flags & 1)
+        return 0;
+    b = strrchr(e->name, '/');
+    b = b ? b + 1 : e->name;
+    while (*p) {
+        int n = 0;
+        while (*p == ';' || *p == ',' || *p == ' ')
+            p++;
+        while (*p && *p != ';' && *p != ',' && *p != ' ' && n < 40)
+            pat[n++] = *p++;
+        pat[n] = 0;
+        if (n && find_match(b, pat))
+            return 1;
+    }
+    return 0;
+}
+
+/* the rows shown again (the list or the filter changed); members that
+   are hidden aren't selected, so nothing unseen is extracted or deleted */
+static void aw_refilter(AWIN *w)
+{
+    int i;
+    free(w->vis);
+    free(w->rowof);
+    w->nv = 0;
+    w->vis = (int *)malloc((w->n + 1) * sizeof(int));
+    w->rowof = (int *)malloc((w->n + 1) * sizeof(int));
+    if (!w->vis || !w->rowof) {
+        free(w->vis);
+        free(w->rowof);
+        w->vis = w->rowof = 0;
+        w->filt[0] = 0;                      /* can't: show none */
+        return;
+    }
+    for (i = 0; i < w->n; i++)
+        if (aw_shows(w, &w->e[i])) {
+            w->rowof[i] = w->nv;
+            w->vis[w->nv++] = i;
+        } else {
+            w->rowof[i] = -1;
+            w->e[i].sel = 0;
+        }
+    if (w->cur >= w->n || (w->cur >= 0 && w->rowof[w->cur] < 0))
+        w->cur = -1;
+    if (w->anchor >= w->n || (w->anchor >= 0 && w->rowof[w->anchor] < 0))
+        w->anchor = -1;
 }
 
 static void aw_take_list(AWIN *w, const u8 *b, long len)
@@ -762,6 +767,7 @@ static void aw_take_list(AWIN *w, const u8 *b, long len)
         w->n++;
     }
     w->isnew = 0;
+    aw_refilter(w);
 }
 
 static void aw_close(AWIN *w)
@@ -802,6 +808,7 @@ static AWIN *aw_open(const char *path, int fmt, int isnew)
     w->fmt = fmt;
     w->isnew = isnew;
     w->anchor = -1;
+    w->cur = -1;
     w->serial = ++aw_serial;
     wk.g_x = wk.g_y = 0;
     wk.g_w = 72 * cell_w;
@@ -839,6 +846,16 @@ static int aw_count_sel(AWIN *w)
     return n;
 }
 
+/* for the menu: an archive that has been read, and for Extract selected
+   something selected in it */
+
+static int aw_can_extract(struct AWIN *w, int selected)
+{
+    if (!w || w->isnew)
+        return 0;
+    return !selected || aw_count_sel(w) > 0;
+}
+
 /* ------------------------------------------------------------ the tasks */
 
 typedef struct {
@@ -850,6 +867,17 @@ typedef struct {
     int   nitems;                            /* files being added         */
     int   handle;                            /* the archive's window      */
     long  serial;                            /* ... and which one         */
+    int   setf, clrf;                        /* AJ_* flags forced on, off */
+    int   copy_h;                            /* extract for a copy into   */
+    long  copy_serial;                       /* ... this archive window   */
+    char  cleanup[256];                      /* temp folder, removed after */
+    char  map[256];                          /* copy: FAT's names -> originals */
+    int   addclr;                            /* copy: clrf for its add    */
+    char  movel[256];                        /* cut: members to delete... */
+    char  movep[256];                        /* ... from this archive     */
+    int   movefmt;                           /* ... in its format         */
+    char  rnold[256], rnnew[256];            /* rename: member or folder  */
+    char  dell[256];                         /* rename: names to take out */
 } TASK;
 
 static TASK *tasks;
@@ -934,6 +962,8 @@ static void queue_extract(const char *arc, AWIN *w, int selected)
     if (!t)
         return;
     extract_dest(arc, t->out);
+    /* read as the window's format, else what the contents show */
+    t->afmt = w ? w->fmt : AF_NONE;
     if (w)
         t->handle = w->handle, t->serial = w->serial;
     if (w && selected && aw_count_sel(w)) {
@@ -961,6 +991,7 @@ static void queue_list(AWIN *w)
         return;
     t->handle = w->handle;
     t->serial = w->serial;
+    t->afmt = w->fmt;                        /* read as the window's format */
     w->busy = 1;
     aw_set_info(w);
     begin();
@@ -1003,37 +1034,49 @@ static void queue_add(const char *arc, int afmt, char **names, int n, AWIN *w)
 #define FL3DACT 0x0600
 #define PD_PAD  16
 
-enum { P_ROOT = 0, P_TOTAL, P_TBOX, P_TBAR, P_FILE, P_FBOX, P_FBAR, P_STAT, P_BTN, P_NOBJ };
-static OBJECT ptree[P_NOBJ];
+static OBJECT ptree[FPROGRESS_NOBJ];
 static char t_total[80], t_file[80], t_stat[80], t_btn[12];
 static char pd_title[40];
 static int  pdlg;                            /* window handle, 0 = closed  */
 static long f_done, f_total = 1;             /* this task's progress       */
 
+#define SET(i, x_, y_, w_, h_) (ptree[i].ob_x = (x_), ptree[i].ob_y = (y_), \
+                                ptree[i].ob_width = (w_), ptree[i].ob_height = (h_))
+
+/* the FPROGRESS tree of the resource file, laid out in pixels here */
 static void build_dialog(void)
 {
     long fill = (scr_planes >= 4) ? 0x00001174L : 0x00001171L;
-    int bak = aes_3d ? FL3DBAK : 0, pad = PD_PAD, pw = 40 * cell_w;
+    int pad = PD_PAD, pw = 40 * cell_w;
     int bh = cell_h > 10 ? 12 : 8, btnh = cell_h + 6, btnw = 11 * cell_w, y;
-    obj_add(ptree, P_ROOT, -1, G_BOX, bak, 0, aes_3d ? 0x00001100L : 0x00011100L,
-            0, 0, pw + 2 * pad, 10);
+    memcpy(ptree, rs_tree(T_FPROGRESS), sizeof ptree);
+    ptree[P_ROOT].ob_flags = aes_3d ? FL3DBAK : 0;
+    ptree[P_ROOT].ob_spec.index = aes_3d ? 0x00001100L : 0x00011100L;
+    SET(P_ROOT, 0, 0, pw + 2 * pad, 10);
     y = pad;
-    obj_add(ptree, P_TOTAL, 0, G_STRING, 0, 0, (long)t_total, pad, y, pw, cell_h);
+    ptree[P_TOTAL].ob_spec.free_string = t_total;
+    SET(P_TOTAL, pad, y, pw, cell_h);
     y += cell_h + 6;
-    obj_add(ptree, P_TBOX, 0, G_BOX, aes_3d ? FL3DIND : 0, aes_3d ? SELECTED : 0,
-            0x00FF1100L, pad, y, pw, bh);
-    obj_add(ptree, P_TBAR, P_TBOX, G_BOX, 0, 0, fill, 0, 0, 0, bh);
+    ptree[P_TBOX].ob_flags = aes_3d ? FL3DIND : 0;
+    ptree[P_TBOX].ob_state = aes_3d ? SELECTED : 0;
+    SET(P_TBOX, pad, y, pw, bh);
+    ptree[P_TBAR].ob_spec.index = fill;
+    SET(P_TBAR, 0, 0, 0, bh);
     y += bh + cell_h;
-    obj_add(ptree, P_FILE, 0, G_STRING, 0, 0, (long)t_file, pad, y, pw, cell_h);
+    ptree[P_FILE].ob_spec.free_string = t_file;
+    SET(P_FILE, pad, y, pw, cell_h);
     y += cell_h + 6;
-    obj_add(ptree, P_FBOX, 0, G_BOX, aes_3d ? FL3DIND : 0, aes_3d ? SELECTED : 0,
-            0x00FF1100L, pad, y, pw, bh);
-    obj_add(ptree, P_FBAR, P_FBOX, G_BOX, 0, 0, fill, 0, 0, 0, bh);
+    ptree[P_FBOX].ob_flags = aes_3d ? FL3DIND : 0;
+    ptree[P_FBOX].ob_state = aes_3d ? SELECTED : 0;
+    SET(P_FBOX, pad, y, pw, bh);
+    ptree[P_FBAR].ob_spec.index = fill;
+    SET(P_FBAR, 0, 0, 0, bh);
     y += bh + cell_h + 4;
-    obj_add(ptree, P_STAT, 0, G_STRING, 0, 0, (long)t_stat, pad, y + (btnh - cell_h) / 2,
-            pw - btnw - 2 * cell_w, cell_h);
-    obj_add(ptree, P_BTN, 0, G_BUTTON, SELECTABLE | EXIT | DEFAULT | LASTOB |
-            (aes_3d ? FL3DACT : 0), 0, (long)t_btn, pad + pw - btnw, y, btnw, btnh);
+    ptree[P_STAT].ob_spec.free_string = t_stat;
+    SET(P_STAT, pad, y + (btnh - cell_h) / 2, pw - btnw - 2 * cell_w, cell_h);
+    ptree[P_BTN].ob_flags = SELECTABLE | EXIT | DEFAULT | LASTOB | (aes_3d ? FL3DACT : 0);
+    ptree[P_BTN].ob_spec.free_string = t_btn;
+    SET(P_BTN, pad + pw - btnw, y, btnw, btnh);
     ptree[P_ROOT].ob_height = y + btnh + pad;
 }
 
@@ -1213,10 +1256,11 @@ static void start_next(void)
         strncpy(j->q.path, t->path, sizeof j->q.path - 1);
         strncpy(j->q.out, t->out, sizeof j->q.out - 1);
         strncpy(j->q.list, t->list, sizeof j->q.list - 1);
+        strncpy(j->q.map, t->map, sizeof j->q.map - 1);
         j->q.afmt = t->afmt;
-        j->q.aflags = (cs.replace ? AJ_REPLACE : 0) | (cs.rename83 ? AJ_RENAME83 : 0) |
-                      (cs.subdirs ? AJ_SUBDIRS : 0) | (cs.paths ? AJ_PATHS : 0) |
-                      (cs.best ? AJ_BEST : 0);
+        j->q.aflags = ((cs.replace ? AJ_REPLACE : 0) | (cs.rename83 ? AJ_RENAME83 : 0) |
+                       (cs.subdirs ? AJ_SUBDIRS : 0) | (cs.paths ? AJ_PATHS : 0) |
+                       (cs.best ? AJ_BEST : 0) | (cs.nomac ? AJ_NOMAC : 0) | t->setf) & ~t->clrf;
         j->q.pf = prefs;
         j->win = (VWIN *)&cur;               /* any non-null tag */
         f_done = 0;
@@ -1228,6 +1272,8 @@ static void start_next(void)
             log_add("Extracting %s to %s", t->path, t->out);
         else if (t->op == OP_ARC_ADD)
             log_add("Adding %d item%s to %s", t->nitems, t->nitems == 1 ? "" : "s", t->path);
+        else if (t->op == OP_ARC_DELETE)
+            log_add("Deleting %d member%s from %s", t->nitems, t->nitems == 1 ? "" : "s", t->path);
         strcpy(t_file, "");
         set_total_text();
         set_stat_text((int)(tpos * 100L / (tn ? tn : 1)));
@@ -1245,6 +1291,348 @@ static void start_next(void)
         return;
     }
     finish_all();
+}
+
+/* ----------------------------------------- copying between archives */
+
+/* Members dragged from one archive window to another: extracted (with
+   their folders) into a temporary folder next to FArchive, then that
+   folder's contents added to the other archive in its own format, and the
+   folder removed. Two ordinary tasks, so the progress dialog and the log
+   show both. */
+/* what the temporary folder holds (top level), as full paths; any
+   number of them (a full list or none: no part of a copy is lost)   */
+static char **cp_names;
+static int  cp_n, cp_cap, cp_bad;
+
+static int copy_scan(void *ctx, const char *name)
+{
+    const char *dir = (const char *)ctx;
+    char *s;
+    if (cp_n == cp_cap) {
+        char **a = realloc(cp_names, (cp_cap = cp_cap ? cp_cap * 2 : 64) * sizeof(char *));
+        if (!a) {
+            cp_bad = 1;
+            return 0;
+        }
+        cp_names = a;
+    }
+    if (!(s = malloc(strlen(dir) + strlen(name) + 1))) {
+        cp_bad = 1;
+        return 0;
+    }
+    strcpy(s, dir);
+    strcat(s, name);
+    cp_names[cp_n++] = s;
+    return 0;
+}
+
+static void cp_clear(void)
+{
+    int i;
+    for (i = 0; i < cp_n; i++)
+        free(cp_names[i]);
+    cp_n = 0;
+    cp_bad = 0;
+}
+
+/* a task is done (ok) or dropped: the copy's next step, or tidying up */
+static void queue_delete_list(const char *arc, int afmt, const char *list, int n);
+static int map_table(const char *map, const char *tab);
+
+/* Fix 8.3 names: in the map, each original name found in the table
+   (old TAB new, one a line) becomes its new name; 0 if it can't be done */
+static int map_table(const char *map, const char *tab)
+{
+    FILE *f = fopen(tab, "r");
+    char **from = 0, **to = 0, line[600];
+    int nt = 0, cap = 0, ok = 1, i;
+    if (!f)
+        return 0;
+    while (ok && fgets(line, sizeof line, f)) {
+        char *t = strchr(line, '\t');
+        line[strcspn(line, "\r\n")] = 0;
+        if (!t)
+            continue;
+        *t++ = 0;
+        if (nt == cap) {
+            char **a = realloc(from, (cap = cap ? cap * 2 : 64) * sizeof(char *));
+            char **b = a ? realloc(to, cap * sizeof(char *)) : 0;
+            if (a) from = a;
+            if (b) to = b;
+            if (!a || !b) { ok = 0; break; }
+        }
+        from[nt] = malloc(strlen(line) + 1);
+        to[nt] = malloc(strlen(t) + 1);
+        if (!from[nt] || !to[nt]) {
+            free(from[nt]);
+            free(to[nt]);
+            ok = 0;
+            break;
+        }
+        strcpy(from[nt], line);
+        strcpy(to[nt], t);
+        nt++;
+    }
+    fclose(f);
+    if (ok) {
+        FILE *m = fopen(map, "r");
+        char **ln = 0, out[700];
+        int n = 0, lc = 0;
+        if (!m)
+            ok = 0;
+        while (ok && fgets(line, sizeof line, m)) {
+            char *t = strchr(line, '\t');
+            const char *o;
+            line[strcspn(line, "\r\n")] = 0;
+            if (!t)
+                continue;
+            *t++ = 0;
+            o = t;
+            for (i = 0; i < nt; i++)
+                if (!strcmp(from[i], t)) {
+                    o = to[i];
+                    break;
+                }
+            sprintf(out, "%s\t%s", line, o);
+            if (n == lc) {
+                char **a = realloc(ln, (lc = lc ? lc * 2 : 64) * sizeof(char *));
+                if (!a) { ok = 0; break; }
+                ln = a;
+            }
+            if (!(ln[n] = malloc(strlen(out) + 1))) { ok = 0; break; }
+            strcpy(ln[n++], out);
+        }
+        if (m)
+            fclose(m);
+        if (ok && n && (m = fopen(map, "w")) != 0) {
+            for (i = 0; i < n; i++)
+                fprintf(m, "%s\n", ln[i]);
+            fclose(m);
+        } else
+            ok = 0;
+        for (i = 0; i < n; i++)
+            free(ln[i]);
+        free(ln);
+    }
+    for (i = 0; i < nt; i++) {
+        free(from[i]);
+        free(to[i]);
+    }
+    free(from);
+    free(to);
+    return ok;
+}
+
+/* a rename: in the map the extracting wrote, every original name that
+   is old (or in the folder old) becomes new; 0 if it can't be done */
+static int map_rename(const char *map, const char *old, const char *nw)
+{
+    FILE *f = map[0] ? fopen(map, "r") : 0;
+    char **ln = 0, line[600], out[600];
+    int n = 0, cap = 0, i, ok = 1;
+    size_t ol = strlen(old);
+    if (!f)
+        return 0;
+    while (fgets(line, sizeof line, f)) {
+        char *tab = strchr(line, '\t'), *o;
+        line[strcspn(line, "\r\n")] = 0;
+        if (!tab)
+            continue;
+        *tab = 0;
+        o = tab + 1;
+        if (strlen(o) >= ol && !strncmp(o, old, ol) && (!o[ol] || o[ol] == '/'))
+            sprintf(out, "%s\t%s%s", line, nw, o + ol);
+        else
+            sprintf(out, "%s\t%s", line, o);
+        if (n == cap) {
+            char **nl = realloc(ln, (cap = cap ? cap * 2 : 16) * sizeof(char *));
+            if (!nl) { ok = 0; break; }
+            ln = nl;
+        }
+        if (!(ln[n] = malloc(strlen(out) + 1))) { ok = 0; break; }
+        strcpy(ln[n++], out);
+    }
+    fclose(f);
+    if (ok && (f = fopen(map, "w")) != 0) {
+        for (i = 0; i < n; i++)
+            fprintf(f, "%s\n", ln[i]);
+        fclose(f);
+    } else
+        ok = 0;
+    for (i = 0; i < n; i++)
+        free(ln[i]);
+    free(ln);
+    return ok && n;
+}
+
+static void copy_step(TASK *t, int ok)
+{
+    char tmp[256], movel[256], movep[256], rnold[256], rnnew[256], dell[256];
+    int h = t->copy_h, addclr = t->addclr, movefmt = t->movefmt;
+    long ser = t->copy_serial;
+    strcpy(movel, t->movel);
+    strcpy(movep, t->movep);
+    strcpy(rnold, t->rnold);
+    strcpy(rnnew, t->rnnew);
+    strcpy(dell, t->dell);
+    t->movel[0] = t->rnold[0] = t->dell[0] = 0;
+    if (t->cleanup[0]) {                     /* the add is done: the temp goes */
+        afs_rmtree(t->cleanup);
+        t->cleanup[0] = 0;
+        if (t->map[0])
+            Fdelete(t->map);
+        t->map[0] = 0;
+        if (t->op == OP_ARC_ADD && t->out[0])
+            Fdelete(t->out);                 /* a rename's names taken out */
+        if (movel[0]) {                      /* a cut: now out of the source */
+            if (ok)
+                queue_delete_list(movep, movefmt, movel, t->nitems);
+            else
+                Fdelete(movel);
+        }
+        return;
+    }
+    if (!h) {
+        if (movel[0])
+            Fdelete(movel);
+        if (dell[0])
+            Fdelete(dell);
+        if (rnold[0] == 1)
+            Fdelete(rnnew);
+        return;
+    }
+    t->copy_h = 0;
+    strcpy(tmp, t->out);                     /* t moves if tasks[] grows */
+    {
+        AWIN *to = find_aw_task(h, ser);
+        char map[256];
+        int n = 0;
+        strcpy(map, t->map);
+        cp_clear();
+        if (ok && to) {
+            afs_scandir(tmp, copy_scan, tmp);
+            n = cp_bad ? 0 : cp_n;
+            if (cp_bad)
+                log_add("Out of memory: %s left as it was", base_name(to->path));
+        }
+        if (n && rnold[0] == 1) {            /* Fix 8.3: a table of new names */
+            if (!map_table(map, rnnew))
+                n = 0;
+        } else if (n && rnold[0] && !map_rename(map, rnold, rnnew))
+            n = 0;                           /* no map: nothing changes */
+        if (rnold[0] == 1)
+            Fdelete(rnnew);                  /* the table: done with */
+        if (!n) {
+            afs_rmtree(tmp);
+            if (map[0])
+                Fdelete(map);
+            if (movel[0])
+                Fdelete(movel);
+            if (dell[0])
+                Fdelete(dell);
+            if (rnold[0] && to)
+                queue_list(to);              /* not renamed: as it was */
+            return;
+        }
+        queue_add(to->path, to->fmt, cp_names, n, to);
+        cp_clear();
+        if (tn > 0 && tasks[tn - 1].op == OP_ARC_ADD) {
+            TASK *a = &tasks[tn - 1];
+            a->setf = AJ_PATHS | AJ_SUBDIRS;
+            a->clrf = addclr;
+            strcpy(a->cleanup, tmp);
+            strcpy(a->map, map);             /* the original names back */
+            strcpy(a->movel, movel);
+            strcpy(a->movep, movep);
+            a->movefmt = movefmt;
+            if (rnold[0]) {                  /* the old names out, same rewrite */
+                strcpy(a->out, dell);
+                a->setf |= AJ_REPLACE;
+                a->clrf |= AJ_NOMAC;
+                a->nitems = 1;
+            }
+        } else {
+            afs_rmtree(tmp);
+            if (map[0])
+                Fdelete(map);
+            if (movel[0])
+                Fdelete(movel);
+            if (dell[0])
+                Fdelete(dell);
+            if (rnold[0])
+                queue_list(to);
+        }
+    }
+}
+
+/* names[] (members of the archive fpath) copied into the archive window
+   to; clr: AJ_ flags its add leaves off; move: deleted from fpath after */
+static void copy_members(const char *fpath, int ffmt, int fh, long fs,
+                         char **names, int nn, AWIN *to, int clr, int move)
+{
+    char tmp[256], dir[256], fp[256];
+    TASK *t;
+    int k, i;
+    FILE *f;
+    if (!nn || !to || same_path(fpath, to->path))
+        return;
+    strcpy(fp, fpath);                       /* names may point into tasks */
+    for (k = 0; k < 1000; k++) {
+        sprintf(dir, "%sFACP%04d", app_folder, (int)((now_ms() / 7 + k) % 10000));
+        if (!exists(dir))
+            break;
+    }
+    if (afs_mkdir(dir) != E_OK) {
+        log_add("Cannot make a temporary folder %s", dir);
+        return;
+    }
+    sprintf(tmp, "%s\\", dir);
+    t = task_new(OP_ARC_EXTRACT, fp);
+    if (!t) {
+        afs_rmtree(dir);
+        return;
+    }
+    strcpy(t->out, tmp);
+    t->afmt = ffmt;
+    t->handle = fh;
+    t->serial = fs;
+    t->setf = AJ_PATHS | AJ_REPLACE;
+    t->copy_h = to->handle;
+    t->copy_serial = to->serial;
+    t->addclr = clr;
+    /* FAT shortens long names in the temporary folder: the extracting
+       notes each file's original name here, the adding puts it back */
+    sprintf(t->map, "%s.MAP", dir);
+    f = list_file(t->list, "w");
+    if (!f) {
+        tn--;
+        afs_rmtree(dir);
+        log_add("Cannot write a list file next to FArchive");
+        return;
+    }
+    for (i = 0; i < nn; i++) {
+        fputs(names[i], f);
+        fputs("\n", f);
+    }
+    fclose(f);
+    t->nitems = nn;
+    if (move) {                              /* a cut: what to delete after */
+        f = list_file(t->movel, "w");
+        if (f) {
+            for (i = 0; i < nn; i++) {
+                fputs(names[i], f);
+                fputs("\n", f);
+            }
+            fclose(f);
+            strcpy(t->movep, fp);
+            t->movefmt = ffmt;
+        } else
+            t->movel[0] = 0;
+    }
+    log_add("%s %d member%s from %s to %s", move ? "Moving" : "Copying", nn, nn == 1 ? "" : "s",
+            base_name(fp), base_name(to->path));
+    begin();
 }
 
 /* the GUI side of job.c */
@@ -1293,14 +1681,25 @@ void win_job_finished(VWIN *vw, JOB *j)
     }
     if (t && t->list[0])
         Fdelete(t->list);
+    /* the next step of a copy, move or rename only if nothing failed (a
+       move or rename takes the originals out after); a move not if some
+       were skipped either (Keep old): they would be lost                */
+    if (t)
+        copy_step(t, !j->res.err && !j->cancel && !cancelling &&
+                  (j->q.op == OP_ARC_LIST || !j->res.acount[1]) &&
+                  !(j->q.op == OP_ARC_ADD && t->movel[0] && j->res.acount[2]));
     /* the archive (may have) changed: read it again - now, or when the
        cancelled batch's dialog is closed                              */
-    if (j->q.op == OP_ARC_ADD) {
+    if (j->q.op == OP_ARC_ADD || j->q.op == OP_ARC_DELETE) {
         AWIN *aw2 = find_aw_path(j->q.path);
         if (aw2) {
-            if (!j->res.err && !j->cancel && !cancelling) {
-                aw2->isnew = 0;
-                queue_list(aw2);
+            /* read again even after an error: the archive may have
+               been written all the same                          */
+            if (!j->cancel && !cancelling) {
+                if (!j->res.err)
+                    aw2->isnew = 0;
+                if (!aw2->isnew)
+                    queue_list(aw2);
             } else
                 aw2->stale = 1;
         }
@@ -1315,6 +1714,7 @@ void win_job_finished(VWIN *vw, JOB *j)
             AWIN *x = find_aw_task(tasks[k].handle, tasks[k].serial);
             if (tasks[k].list[0])
                 Fdelete(tasks[k].list);
+            copy_step(&tasks[k], 0);
             if (x) {
                 x->busy = 0;
                 aw_set_info(x);
@@ -1519,6 +1919,9 @@ static void loose_clear(void)
 }
 
 static int new_archive_name(char *out, const char *suggest);
+static void new_archive_begin(int kind);
+static void pack_loose(void);
+enum { NA_NEW = 1, NA_PACK };                /* what a new archive is for */
 
 /* one name dropped on the icon or given on the command line */
 static void drop_path(const char *p)
@@ -1551,15 +1954,29 @@ static void loose_done(AWIN *into)
     char arc[300];
     if (!nloose)
         return;
+    (void)arc;
     if (into) {
-        queue_add(into->path, into->fmt, loose, nloose, into);
-    } else if (new_archive_name(arc, nloose == 1 ? loose[0] : 0)) {
+        add_files_ask(into, loose, nloose);
+        loose_clear();
+        return;
+    }
+    /* a new archive for them: its format first (a window), then its name;
+       the files wait in loose[] until then */
+    new_archive_begin(NA_PACK);
+}
+
+/* the dropped files, once the new archive's format is chosen */
+static void pack_loose(void)
+{
+    char arc[300];
+    if (nloose && new_archive_name(arc, nloose == 1 ? loose[0] : 0)) {
         int fmt = af_from_name(arc);
         if (exists(arc) && af_detect(arc) != AF_NONE)
             fmt = af_detect(arc);
         if (fmt == AF_NONE)
             fmt = cs.fmt;
         queue_add(arc, fmt, loose, nloose, find_aw_path(arc));
+        begin();
     }
     loose_clear();
 }
@@ -1629,51 +2046,13 @@ static void dropped(char *args, int handle)
 static int  mainw;                           /* window handle             */
 static int  iconified;                       /* 1 AES, 2 our own          */
 static GRECT main_full;                      /* size before iconifying    */
-static short ic_data[64], ic_mask[64];
-static ICONBLK ic_blk;
-static OBJECT ic_tree[2];
+static OBJECT *ic_tree;                      /* T_ICON of the resource file */
 static char ic_label[] = "FArchive";
 
-static void ic_set(int x, int y)
-{
-    if (x >= 0 && x < 32 && y >= 0 && y < 32)
-        ic_data[y * 2 + (x >> 4)] |= (short)(0x8000U >> (x & 15));
-}
-
-/* a box with a strap and a zip */
 static void fa_build_icon(void)
 {
-    int x, y;
-    memset(ic_data, 0, sizeof ic_data);
-    for (x = 3; x < 29; x++) { ic_set(x, 9); ic_set(x, 28); ic_set(x, 13); }
-    for (y = 9; y < 29; y++) { ic_set(3, y); ic_set(28, y); }
-    for (x = 6; x < 26; x++) ic_set(x, 4);   /* lid */
-    for (y = 4; y < 10; y++) { ic_set(6 - (y - 4) / 2, y); ic_set(25 + (y - 4) / 2, y); }
-    for (y = 13; y < 28; y++) {              /* zip down the middle */
-        ic_set(15, y); ic_set(16, y);
-        if (y & 1) { ic_set(14, y); ic_set(17, y); }
-    }
-    for (x = 13; x < 19; x++) { ic_set(x, 15); ic_set(x, 18); }    /* pull */
-    ic_set(13, 16); ic_set(13, 17); ic_set(18, 16); ic_set(18, 17);
-    for (y = 0; y < 32; y++) {
-        ic_mask[y * 2] = (y >= 4 && y <= 28) ? (short)0x1FFF : 0;
-        ic_mask[y * 2 + 1] = (y >= 4 && y <= 28) ? (short)0xFFF8 : 0;
-        if (y >= 9 && y <= 28) {
-            ic_mask[y * 2] = 0x1FFF;
-            ic_mask[y * 2 + 1] = (short)0xFFF8;
-        }
-    }
-    memset(&ic_blk, 0, sizeof ic_blk);
-    ic_blk.ib_pmask = ic_mask;
-    ic_blk.ib_pdata = ic_data;
-    ic_blk.ib_ptext = ic_label;
-    ic_blk.ib_char = 0x1000;
-    ic_blk.ib_xicon = 16; ic_blk.ib_yicon = 0;
-    ic_blk.ib_wicon = 32; ic_blk.ib_hicon = 32;
-    ic_blk.ib_xtext = 0; ic_blk.ib_ytext = 32;
-    ic_blk.ib_wtext = 64; ic_blk.ib_htext = 8;
-    obj_add(ic_tree, 0, -1, G_IBOX, 0, 0, 0L, 0, 0, 64, 40);
-    obj_add(ic_tree, 1, 0, G_ICON, LASTOB, 0, (long)&ic_blk, 0, 0, 64, 40);
+    ic_tree = rs_tree(T_ICON);
+    ic_tree[1].ob_spec.iconblk->ib_ptext = ic_label;
 }
 
 static void draw_main(GRECT *clip)
@@ -1710,7 +2089,7 @@ static void draw_main(GRECT *clip)
     v_gtext(vdih, x, y, "FArchive " FA_VERSION " (" FV_CPU ") - drop archives or files here");
     vst_effects(vdih, 0);
     y += cell_h + 6;
-    sprintf(line, "New archives: %s%s", af_name(cs.fmt), cs.best ? ", best compression" : "");
+    sprintf(line, "New archives: format asked for (last %s%s)", af_name(cs.fmt), cs.best ? ", best" : "");
     v_gtext(vdih, x, y, line); y += cell_h;
     sprintf(line, "Dropped archives are %s", cs.xdrop ? "extracted" : "opened");
     v_gtext(vdih, x, y, line); y += cell_h;
@@ -1930,17 +2309,20 @@ static void open_main(void)
 
 /* ------------------------------------------------------------- commands */
 
+/* About: a window of its own (nothing waits for it) */
+static int about_exit(WDIALOG *d, int obj)
+{
+    (void)d; (void)obj;
+    return 1;
+}
+
 static void about(void)
 {
-    char buf[300];
-    sprintf(buf, "[1][FArchive " FA_VERSION " - archiver|"
-            FV_CPU " version|"
-            "ZIP LHA ZOO ARC LZX TAR GZ.|Drop archives or files on the icon.|"
-            "%s][ OK ]",
-            !have_mint ? "TOS: working in FArchive" :
-            !have_worker ? "MiNT: FAWORK.TTP not found" :
-                           "MiNT: background workers");
-    form_alert(1, buf);
+    WDIALOG *d = wd_open(T_ABOUT, rs(S_W_ABOUT), 0, about_exit, 0, 0);
+    if (!d)
+        return;
+    rsf(wd_text(d, AB_VER), 60, S_S_VERSION, FA_VERSION, FV_CPU);
+    wd_redraw_obj(d, AB_VER);
 }
 
 static char sel_path[300];
@@ -1997,6 +2379,55 @@ static void do_extract_file(void)
     begin();
 }
 
+/* The format of a new archive, asked as it is made: a window of its own
+   (nothing waits for it) with the formats as radio buttons and Best
+   compression, set to the last ones used. OK goes on to the name. */
+static const int nf_obj[AF_COUNT - 1] = { NF_ZIP, NF_LHA, NF_ZOO, NF_ARC, NF_LZX, NF_TAR, NF_TGZ, NF_GZ };
+static WDIALOG *nf_dlg;
+static void new_archive_go(int kind);
+
+static int nf_exit(WDIALOG *d, int obj)
+{
+    OBJECT *t = wd_tree(d);
+    int kind = (int)(long)wd_ctx(d), i;
+    nf_dlg = 0;
+    if (obj == NF_OK) {
+        for (i = 0; i < AF_COUNT - 1; i++)
+            if (t[nf_obj[i]].ob_state & SELECTED)
+                cs.fmt = i + 1;
+        cs.best = (t[NF_BEST].ob_state & SELECTED) != 0;
+        settings_save();                     /* the next new archive starts here */
+        new_archive_go(kind);
+    } else if (kind == NA_PACK)
+        loose_clear();                       /* the dropped files: not packed */
+    return 1;
+}
+
+/* open the format window (or bring it to the front) */
+static void new_archive_begin(int kind)
+{
+    OBJECT *t;
+    int i;
+    if (nf_dlg) {
+        wd_close(nf_dlg);                    /* one at a time: the newest wins */
+        nf_dlg = 0;
+    }
+    nf_dlg = wd_open(T_NEWFMT, rs(S_W_NEWFMT), 0, nf_exit, 0, (void *)(long)kind);
+    if (!nf_dlg)
+        return;
+    t = wd_tree(nf_dlg);
+    for (i = 0; i < AF_COUNT - 1; i++) {
+        t[nf_obj[i]].ob_state &= ~SELECTED;
+        if (cs.fmt == i + 1 || (i == 0 && (cs.fmt <= AF_NONE || cs.fmt >= AF_COUNT)))
+            t[nf_obj[i]].ob_state |= SELECTED;
+    }
+    if (cs.best)
+        t[NF_BEST].ob_state |= SELECTED;
+    else
+        t[NF_BEST].ob_state &= ~SELECTED;
+    wd_redraw_obj(nf_dlg, NF_ROOT);
+}
+
 /* a name for a new archive, with the extension of the format */
 static int new_archive_name(char *out, const char *suggest)
 {
@@ -2036,8 +2467,18 @@ static int new_archive_name(char *out, const char *suggest)
 
 static void do_new(void)
 {
+    new_archive_begin(NA_NEW);
+}
+
+/* the format is chosen: the name, then the archive or the packing */
+static void new_archive_go(int kind)
+{
     char arc[300];
     int fmt;
+    if (kind == NA_PACK) {
+        pack_loose();
+        return;
+    }
     if (!new_archive_name(arc, 0))
         return;
     if (exists(arc)) {
@@ -2063,17 +2504,310 @@ static void do_add_files(void)
     if (!pick_file(full, "Add to the archive (no name: folder)", 1))
         return;
     one[0] = full;
-    queue_add(w->path, w->fmt, one, 1, w);
+    add_files_ask(w, one, 1);
+}
+
+/* the selected members only (nothing selected: nothing to do) */
+static void do_extract_sel(void)
+{
+    AWIN *w = top_awin();
+    if (!w || w->isnew || !aw_count_sel(w))
+        return;
+    queue_extract(w->path, w, 1);
     begin();
 }
 
-static void do_extract_sel(void)
+/* every member of the archive, whatever is selected */
+static void do_extract_all(void)
 {
     AWIN *w = top_awin();
     if (!w || w->isnew)
         return;
-    queue_extract(w->path, w, 1);
+    queue_extract(w->path, w, 0);
     begin();
+}
+
+/* ---------------------------------------------------------- finding */
+
+/* does one path part (or the whole name) match? Case doesn't matter;
+   * any run of characters, ? any one */
+static int wild(const char *p, const char *s, const char *end)
+{
+    for (; *p; p++, s++) {
+        if (*p == '*') {
+            for (p++; ; s++) {
+                if (wild(p, s, end))
+                    return 1;
+                if (s >= end)
+                    return 0;
+            }
+        }
+        if (s >= end)
+            return 0;
+        if (*p != '?' && toupper((unsigned char)*p) != toupper((unsigned char)*s))
+            return 0;
+    }
+    return s >= end;
+}
+
+/* a member matches: with * or ? the pattern is matched against each part of
+   its path (a file or any folder on the way); otherwise the text is looked
+   for anywhere in the path. "readme" finds DOCS/README.TXT, "*.c" every C
+   file, "src" the folder SRC/ and what's in it. */
+static int find_match(const char *name, const char *pat)
+{
+    const char *s, *part;
+    size_t n = strlen(pat);
+    if (!*pat)
+        return 0;
+    if (!strpbrk(pat, "*?")) {
+        for (s = name; *s; s++) {
+            size_t k;
+            for (k = 0; k < n && s[k] &&
+                 toupper((unsigned char)s[k]) == toupper((unsigned char)pat[k]); k++) ;
+            if (k == n)
+                return 1;
+        }
+        return 0;
+    }
+    for (part = name; *part; ) {
+        const char *e = part;
+        while (*e && *e != '/' && *e != '\\')
+            e++;
+        if (e > part && wild(pat, part, e))
+            return 1;
+        part = *e ? e + 1 : e;
+    }
+    return 0;
+}
+
+/* bring row i into view (a third of the way down when it has to move) */
+static void aw_show_row(AWIN *w, int i)
+{
+    int vis = aw_rows(w), r;
+    w->anchor = i;
+    if (i < 0 || i >= w->n || !w->rowof || (r = w->rowof[i]) < 0)
+        return;
+    if (r < w->top || r >= w->top + vis)
+        w->top = r - vis / 3;
+}
+
+/* select every match, show the first */
+static void find_all(AWIN *w)
+{
+    int i, n = 0, first = -1;
+    for (i = 0; i < w->n; i++) {
+        w->e[i].sel = (u8)(w->rowof && w->rowof[i] >= 0 &&
+                           find_match(w->e[i].name, find_pat));
+        if (w->e[i].sel) {
+            n++;
+            if (first < 0) first = i;
+        }
+    }
+    if (first < 0) {
+        aw_changed(w);
+        alertf("[1][FArchive: nothing in this|archive matches|\"%.30s\".][ OK ]", find_pat);
+        return;
+    }
+    aw_show_row(w, first);
+    aw_changed(w);
+    log_add("Find \"%s\" in %s: %d match%s", find_pat, base_name(w->path), n, n == 1 ? "" : "es");
+}
+
+/* Archive > Find: a window of its own; the archive it is for is the one
+   on top when Find was chosen (found by its handle and serial again) */
+typedef struct { int handle; long serial; } FINDFOR;
+static WDIALOG *fd_dlg;
+
+static int fd_exit(WDIALOG *d, int obj)
+{
+    FINDFOR *ff = (FINDFOR *)wd_ctx(d);
+    fd_dlg = 0;
+    if (obj == FD_OK) {
+        const char *t = wd_field(d, FD_FIELD);
+        AWIN *w = find_aw_task(ff->handle, ff->serial);
+        if (t && *t && w) {
+            strncpy(find_pat, t, sizeof find_pat - 1);
+            find_pat[sizeof find_pat - 1] = 0;
+            find_all(w);
+            fa_menu_update();
+        }
+    }
+    free(ff);
+    return 1;
+}
+
+static void do_find(AWIN *w)
+{
+    FINDFOR *ff;
+    if (!aw_can_extract(w, 0))
+        return;
+    if (fd_dlg) {                            /* closed without its callback */
+        free(wd_ctx(fd_dlg));
+        wd_close(fd_dlg);
+    }
+    fd_dlg = 0;
+    ff = (FINDFOR *)malloc(sizeof *ff);
+    if (!ff)
+        return;
+    ff->handle = w->handle;
+    ff->serial = w->serial;
+    fd_dlg = wd_open(T_FIND, rs(S_W_FIND), FD_FIELD, fd_exit, 0, ff);
+    if (!fd_dlg) {
+        free(ff);
+        return;
+    }
+    wd_set_field(fd_dlg, FD_FIELD, find_pat);
+}
+
+static int aw_filtered(AWIN *w)
+{
+    return w && w->filt[0];
+}
+
+/* Archive > Filter: a window of its own, for the archive on top when
+   it was chosen; Show all (or nothing typed) takes the filter away */
+static WDIALOG *fl_dlg;
+
+static int fl_exit(WDIALOG *d, int obj)
+{
+    FINDFOR *ff = (FINDFOR *)wd_ctx(d);
+    AWIN *w = find_aw_task(ff->handle, ff->serial);
+    fl_dlg = 0;
+    if (w && (obj == FL_OK || obj == FL_ALL)) {
+        const char *t = obj == FL_OK ? wd_field(d, FL_FIELD) : "";
+        while (*t == ' ')
+            t++;
+        sprintf(w->filt, "%.40s", t);
+        aw_refilter(w);
+        w->top = 0;
+        aw_changed(w);
+    }
+    free(ff);
+    return 1;
+}
+
+static void do_filter(AWIN *w)
+{
+    FINDFOR *ff;
+    if (!w || w->isnew)
+        return;
+    if (fl_dlg) {
+        free(wd_ctx(fl_dlg));
+        wd_close(fl_dlg);
+    }
+    fl_dlg = 0;
+    if (!(ff = (FINDFOR *)malloc(sizeof *ff)))
+        return;
+    ff->handle = w->handle;
+    ff->serial = w->serial;
+    fl_dlg = wd_open(T_FILTER, rs(S_W_FILTER), FL_FIELD, fl_exit, 0, ff);
+    if (!fl_dlg) {
+        free(ff);
+        return;
+    }
+    wd_set_field(fl_dlg, FL_FIELD, w->filt);
+}
+
+/* Archive > Check 8.3 names: is the archive safe to extract on TOS as it
+   is? Every member whose name, or a folder on its way, isn't a valid 8.3
+   name is selected and listed in the log (Mac files too, unless Skip Mac
+   files leaves them out anyway). */
+static void lw_open(const char *title, char **line, int n);
+
+static void check83(AWIN *w)
+{
+    int i, bad = 0, mac = 0, shown = 0, nl = 0;
+    char **list;
+    if (!aw_can_extract(w, 0))
+        return;
+    list = (char **)malloc((w->n + 1) * sizeof(char *));
+    log_add("8.3 check of %s:", base_name(w->path));
+    if (w && w->filt[0]) {                   /* the whole archive: no filter */
+        w->filt[0] = 0;
+        aw_refilter(w);
+    }
+    for (i = 0; i < w->n; i++) {
+        char part[256];
+        const char *p = w->e[i].name, *e;
+        int ok = 1;
+        w->e[i].sel = 0;
+        if (af_mac_meta(w->e[i].name)) {
+            mac++;
+            if (cs.nomac)
+                continue;                    /* left out when extracting */
+        }
+        while (*p && ok) {
+            size_t n;
+            for (e = p; *e && *e != '/' && *e != '\\'; e++) ;
+            n = (size_t)(e - p);
+            if (n && n < sizeof part) {
+                memcpy(part, p, n);
+                part[n] = 0;
+                if (!af_valid83(part))
+                    ok = 0;
+            }
+            p = *e ? e + 1 : e;
+        }
+        if (!ok) {
+            w->e[i].sel = 1;
+            if (!bad)
+                aw_show_row(w, i);
+            bad++;
+            if (shown++ < 30)
+                log_add("  not 8.3: %s", w->e[i].name);
+            if (list && (list[++nl] = (char *)malloc(strlen(w->e[i].name) + 3)) != 0)
+                sprintf(list[nl], "  %s", w->e[i].name);
+            else if (list)
+                nl--;
+        }
+    }
+    if (shown > 30)
+        log_add("  ... and %d more", shown - 30);
+    aw_changed(w);
+    if (!bad) {
+        log_add("  all %d member%s have 8.3 names: TOS safe%s", w->n, w->n == 1 ? "" : "s",
+                mac && cs.nomac ? " (Mac files left out)" : "");
+        alertf("[1][FArchive: every name in|%.30s|is a valid 8.3 name:|safe to extract on TOS.][ OK ]",
+               base_name(w->path));
+        if (list)
+            free(list);
+    } else if (list && (list[0] = (char *)malloc(80)) != 0) {
+        /* the list in a window of its own: heading, then the names */
+        char title[80];
+        sprintf(list[0], "%d of %d member%s: not 8.3 names", bad, w->n, w->n == 1 ? "" : "s");
+        sprintf(title, "Not 8.3: %.40s", base_name(w->path));
+        log_add("  %d member%s with names that aren't 8.3", bad, bad == 1 ? "" : "s");
+        lw_open(title, list, nl + 1);
+    } else {
+        if (list) {
+            for (i = 1; i <= nl; i++)
+                free(list[i]);
+            free(list);
+        }
+        log_add("  %d member%s with names that aren't 8.3", bad, bad == 1 ? "" : "s");
+        alertf("[2][FArchive: %d member%s of|%.30s|have names that aren't 8.3.|They are selected and|listed in the log.][ OK ]",
+               bad, bad == 1 ? "" : "s", base_name(w->path));
+    }
+}
+
+/* Archive > Find next: the next match after the last one shown (wraps) */
+static void find_next(AWIN *w)
+{
+    int i, k;
+    if (!aw_can_extract(w, 0) || !find_pat[0])
+        return;
+    for (k = 1; k <= w->n; k++) {
+        i = (w->anchor + k) % w->n;
+        if (w->rowof && w->rowof[i] >= 0 && find_match(w->e[i].name, find_pat)) {
+            w->e[i].sel = 1;
+            w->anchor = w->cur = i;
+            aw_show_row(w, i);
+            aw_changed(w);
+            return;
+        }
+    }
+    alertf("[1][FArchive: nothing in this|archive matches|\"%.30s\".][ OK ]", find_pat);
 }
 
 static void select_all(AWIN *w, int on)
@@ -2082,7 +2816,7 @@ static void select_all(AWIN *w, int on)
     if (!w)
         return;
     for (i = 0; i < w->n; i++)
-        w->e[i].sel = (u8)on;
+        w->e[i].sel = (u8)(on && w->rowof && w->rowof[i] >= 0);
     aw_changed(w);
 }
 
@@ -2096,36 +2830,37 @@ static void changed(void)
 
 static void do_menu(int title, int item)
 {
-    int t = title - 3, k = item - m_first[t >= 0 && t < NTITLE ? t : 0];
-    switch (t) {
-    case 0:
-        if (k == D_ABOUT) about();
-        break;
-    case 1:
-        if (k == F_OPEN) do_open();
-        else if (k == F_NEW) do_new();
-        else if (k == F_EXTRACT) do_extract_file();
-        else if (k == F_XSEL) do_extract_sel();
-        else if (k == F_ADD) do_add_files();
-        else if (k == F_SELALL) select_all(top_awin(), 1);
-        else if (k == F_CLOSE) { AWIN *w = top_awin(); if (w) aw_close(w); }
-        else if (k == F_DEST) { choose_dest(); changed(); }
-        else if (k == F_QUIT) quitting = 1;
-        break;
-    case 2:
-        if (k >= X_FIRST && k < X_FIRST + AF_COUNT - 1) cs.fmt = k - X_FIRST + 1;
-        else if (k == X_BEST) cs.best = !cs.best;
-        changed();
-        break;
-    case 3:
-        if (k == O_XDROP) cs.xdrop = !cs.xdrop;
-        else if (k == O_FOLDER) cs.folder = !cs.folder;
-        else if (k == O_PATHS) cs.paths = !cs.paths;
-        else if (k == O_REPLACE) cs.replace = !cs.replace;
-        else if (k == O_SUBDIRS) cs.subdirs = !cs.subdirs;
-        else if (k == O_83) cs.rename83 = !cs.rename83;
-        changed();
-        break;
+    switch (item) {
+    case MI_ABOUT:   about(); break;
+    case MI_OPEN:    do_open(); break;
+    case MI_NEW:     do_new(); break;
+    case MI_EXTRACT: do_extract_file(); break;
+    case MI_DEST:    choose_dest(); changed(); break;
+    case MI_QUIT:    quitting = 1; break;
+    case MI_XSEL:    do_extract_sel(); break;
+    case MI_XALL:    do_extract_all(); break;
+    case MI_FIND:    do_find(top_awin()); break;
+    case MI_FNEXT:   find_next(top_awin()); break;
+    case MI_ADD:     do_add_files(); break;
+    case MI_CUT:     edit_copy(1); break;
+    case MI_COPY:    edit_copy(0); break;
+    case MI_PASTE:   edit_paste(); break;
+    case MI_DELETE:  do_delete(); break;
+    case MI_FILTER:  do_filter(top_awin()); break;
+    case MI_FIX83:   fix83(top_awin()); break;
+    case MI_RENAME:  do_rename(); break;
+    case MI_SELALL:  select_all(top_awin(), 1); break;
+    case MI_SELNONE: select_all(top_awin(), 0); break;
+    case MI_CLOSE:   { AWIN *w = top_awin(); if (w) aw_close(w); } break;
+    case MI_XDROP:   cs.xdrop = !cs.xdrop; changed(); break;
+    case MI_FOLDER:  cs.folder = !cs.folder; changed(); break;
+    case MI_PATHS:   cs.paths = !cs.paths; changed(); break;
+    case MI_REPLACE: cs.replace = !cs.replace; changed(); break;
+    case MI_SUBDIRS: cs.subdirs = !cs.subdirs; changed(); break;
+    case MI_83:      cs.rename83 = !cs.rename83; changed(); break;
+    case MI_NOMAC:   cs.nomac = !cs.nomac; changed(); break;
+    case MI_CONFIRM: cs.confirm = !cs.confirm; changed(); break;
+    case MI_CHECK83: check83(top_awin()); break;
     }
     menu_tnormal(menu, title, 1);
 }
@@ -2297,12 +3032,180 @@ static void aw_message(AWIN *w, short *msg)
     }
     case WM_VSLID: {
         int vis = aw_rows(w);
-        if (w->n > vis)
-            w->top = (long)msg[4] * (w->n - vis) / 1000;
+        if (w->nv > vis)
+            w->top = (long)msg[4] * (w->nv - vis) / 1000;
         aw_changed(w);
         break;
     }
     }
+}
+
+/* ------------------------------------------------ the 8.3 list window */
+
+/* A window listing lines of text (Check 8.3 names: the members whose names
+   aren't 8.3), with a scroll bar; one at a time, the newest replaces it. */
+static struct {
+    int    handle;
+    char   title[80];
+    char **line;
+    int    n;
+    long   top;
+} lw;
+
+static int lw_rows(void)
+{
+    GRECT wk;
+    int n;
+    wind_get_grect(lw.handle, WF_WORKXYWH, &wk);
+    n = (wk.g_h - 4) / cell_h;
+    return n < 1 ? 1 : n;
+}
+
+static void lw_slider(void)
+{
+    int vis = lw_rows();
+    if (lw.top > lw.n - vis) lw.top = lw.n - vis;
+    if (lw.top < 0) lw.top = 0;
+    wind_set(lw.handle, WF_VSLSIZE, lw.n <= vis ? 1000 : (short)(1000L * vis / lw.n), 0, 0, 0);
+    wind_set(lw.handle, WF_VSLIDE, lw.n <= vis ? 0 : (short)(1000L * lw.top / (lw.n - vis)), 0, 0, 0);
+}
+
+static void lw_free(void)
+{
+    int i;
+    for (i = 0; i < lw.n; i++)
+        free(lw.line[i]);
+    free(lw.line);
+    lw.line = 0;
+    lw.n = 0;
+    lw.top = 0;
+}
+
+static void lw_close(void)
+{
+    if (lw.handle > 0) {
+        wind_close(lw.handle);
+        wind_delete(lw.handle);
+    }
+    lw.handle = 0;
+    lw_free();
+}
+
+static void lw_redraw(GRECT *area)
+{
+    GRECT r, a = *area, wk;
+    short pxy[4], d, none[4] = { 0, 0, 0, 0 };
+    int i, y;
+    if (lw.handle <= 0 || !rc_intersect(&desk, &a))
+        return;
+    wind_get_grect(lw.handle, WF_WORKXYWH, &wk);
+    wind_update(BEG_UPDATE);
+    graf_mouse(M_OFF, 0);
+    wind_get_grect(lw.handle, WF_FIRSTXYWH, &r);
+    while (r.g_w && r.g_h) {
+        if (rc_intersect(&a, &r)) {
+            pxy[0] = r.g_x; pxy[1] = r.g_y;
+            pxy[2] = r.g_x + r.g_w - 1; pxy[3] = r.g_y + r.g_h - 1;
+            vs_clip(vdih, 1, pxy);
+            vsf_interior(vdih, 1);
+            vsf_color(vdih, 0);
+            vswr_mode(vdih, MD_REPLACE);
+            vr_recfl(vdih, pxy);
+            vst_height(vdih, cell_h > 10 ? 13 : 6, &d, &d, &d, &d);
+            vst_alignment(vdih, 0, 5, &d, &d);
+            vswr_mode(vdih, MD_TRANS);
+            vst_color(vdih, 1);
+            y = wk.g_y + 2;
+            for (i = (int)lw.top; i < lw.n && y < wk.g_y + wk.g_h; i++, y += cell_h) {
+                vst_effects(vdih, i == 0 ? 1 : 0);      /* the heading in bold */
+                v_gtext(vdih, wk.g_x + cell_w / 2, y, lw.line[i]);
+            }
+            vst_effects(vdih, 0);
+        }
+        wind_get_grect(lw.handle, WF_NEXTXYWH, &r);
+    }
+    vs_clip(vdih, 0, none);
+    graf_mouse(M_ON, 0);
+    wind_update(END_UPDATE);
+}
+
+/* takes the lines (malloc'd array of malloc'd strings) */
+static void lw_open(const char *title, char **line, int n)
+{
+    GRECT r, wk;
+    int kind = NAME | CLOSER | MOVER | SIZER | FULLER | UPARROW | DNARROW | VSLIDE;
+    lw_close();
+    lw.line = line;
+    lw.n = n;
+    lw.top = 0;
+    sprintf(lw.title, " %.70s ", title);
+    lw.handle = wind_create_grect(kind, &desk);
+    if (lw.handle <= 0) {
+        lw.handle = 0;
+        lw_free();
+        alertf("[1][FArchive: no window free|for the list (it is|in the log too).][ OK ]");
+        return;
+    }
+    wk.g_w = 64 * cell_w;
+    wk.g_h = (n < 16 ? n + 1 : 16) * cell_h + 4;
+    if (wk.g_h < 6 * cell_h) wk.g_h = 6 * cell_h;
+    wk.g_x = wk.g_y = 0;
+    wind_calc_grect(WC_BORDER, kind, &wk, &r);
+    if (r.g_w > desk.g_w) r.g_w = desk.g_w;
+    if (r.g_h > desk.g_h) r.g_h = desk.g_h;
+    r.g_x = desk.g_x + (desk.g_w - r.g_w) / 2;
+    r.g_y = desk.g_y + (desk.g_h - r.g_h) / 3;
+    wind_set_str(lw.handle, WF_NAME, lw.title);
+    wind_open_grect(lw.handle, &r);
+    lw_slider();
+}
+
+/* 1 if the message was for the list window */
+static int lw_message(short *msg)
+{
+    GRECT *r = (GRECT *)&msg[4];
+    int vis;
+    if (lw.handle <= 0 || msg[3] != lw.handle)
+        return 0;
+    switch (msg[0]) {
+    case WM_REDRAW:  lw_redraw(r); break;
+    case WM_TOPPED:  wind_set(lw.handle, WF_TOP, 0, 0, 0, 0); break;
+    case WM_CLOSED:  lw_close(); break;
+    case WM_MOVED:   wind_set_grect(lw.handle, WF_CURRXYWH, r); break;
+    case WM_SIZED:
+    case WM_FULLED: {
+        GRECT n = *r;
+        if (msg[0] == WM_FULLED)
+            n = desk;
+        if (n.g_w < 20 * cell_w) n.g_w = 20 * cell_w;
+        if (n.g_h < 4 * cell_h) n.g_h = 4 * cell_h;
+        wind_set_grect(lw.handle, WF_CURRXYWH, &n);
+        lw_slider();
+        post_redraw_h(lw.handle);
+        break;
+    }
+    case WM_ARROWED:
+        vis = lw_rows();
+        switch (msg[4]) {
+        case 0: lw.top -= vis; break;
+        case 1: lw.top += vis; break;
+        case 2: lw.top--; break;
+        case 3: lw.top++; break;
+        }
+        lw_slider();
+        post_redraw_h(lw.handle);
+        break;
+    case WM_VSLID:
+        vis = lw_rows();
+        if (lw.n > vis)
+            lw.top = (long)msg[4] * (lw.n - vis) / 1000;
+        lw_slider();
+        post_redraw_h(lw.handle);
+        break;
+    default:
+        return 0;
+    }
+    return 1;
 }
 
 static void message(short *msg)
@@ -2312,6 +3215,10 @@ static void message(short *msg)
     if (msg[0] != WM_REDRAW)
         dbg("message %04x from %d: %d %d %d %d %d", (unsigned short)msg[0], msg[1],
             msg[3], msg[4], msg[5], msg[6], msg[7]);
+    if (wd_message(msg))                     /* dialogs and alerts in windows */
+        return;
+    if (lw_message(msg))                     /* the 8.3 list */
+        return;
     switch (msg[0]) {
     case MN_SELECTED:  do_menu(msg[3], msg[4]); return;
     case AP_TERM:      quitting = 1; return;
@@ -2423,26 +3330,1039 @@ static void message(short *msg)
 
 /* a click in an archive window: select it (Shift: add or take away one,
    Control: everything from the last click), double click: extract it  */
+/* ------------------------------------------------------------- Edit */
+
+static int lc_same(const char *a, const char *b)
+{
+    while (*a && toupper((u8)*a) == toupper((u8)*b))
+        a++, b++;
+    return !*a && !*b;
+}
+
+static int lc_prefix(const char *s, const char *pre)
+{
+    while (*pre && toupper((u8)*s) == toupper((u8)*pre))
+        s++, pre++;
+    return !*pre;
+}
+
+static void names_free(char **names, int n)
+{
+    int i;
+    if (!names)
+        return;
+    for (i = 0; i < n; i++)
+        free(names[i]);
+    free(names);
+}
+
+static char **names_dup(char **src, int n)
+{
+    char **d = (char **)calloc(n ? n : 1, sizeof(char *));
+    int i;
+    if (!d)
+        return 0;
+    for (i = 0; i < n; i++)
+        if (!(d[i] = (char *)malloc(strlen(src[i]) + 1))) {
+            names_free(d, i);
+            return 0;
+        } else
+            strcpy(d[i], src[i]);
+    return d;
+}
+
+/* the selected members' names, copied */
+static char **names_sel(AWIN *w, int *n)
+{
+    char **d;
+    int i, k = 0;
+    *n = aw_count_sel(w);
+    d = (char **)calloc(*n ? *n : 1, sizeof(char *));
+    if (!d)
+        return 0;
+    for (i = 0; i < w->n && k < *n; i++)
+        if (w->e[i].sel) {
+            if (!(d[k] = (char *)malloc(strlen(w->e[i].name) + 1))) {
+                names_free(d, k);
+                return 0;
+            }
+            strcpy(d[k++], w->e[i].name);
+        }
+    return d;
+}
+
+/* Adding to an archive window - members of another archive (a drag or
+   Paste) or files: with Options > Confirm changes an alert in a window
+   asks first, Replace / Keep old if some are in the archive already
+   (nothing waits for it); the windows are found again by handle and
+   serial when it is answered */
+typedef struct {
+    int    files;                            /* names: files, else members */
+    char   fpath[256];                       /* members: of this archive   */
+    int    ffmt, fh;
+    long   fs;
+    int    th;                               /* into this window           */
+    long   ts;
+    char **names;
+    int    n;
+    int    move;                             /* Cut and Paste              */
+    int    repl;                             /* the alert has Keep old     */
+} ADDASK;
+
+static struct {                              /* Edit > Cut / Copy          */
+    char   path[256];
+    int    fmt, h;
+    long   s;
+    char **names;
+    int    n;
+    int    cut;
+} clip;
+
+/* how: 0 a window not busy, 1 and something selected in a read
+   archive, 2 and members can be deleted from it */
+static int aw_editable(AWIN *w, int how)
+{
+    if (!w || w->busy)
+        return 0;
+    if (how && !aw_can_extract(w, 1))
+        return 0;
+    return how < 2 || w->fmt != AF_GZ;
+}
+
+static int clip_has(void)
+{
+    return clip.n > 0;
+}
+
+static void clip_clear(void)
+{
+    names_free(clip.names, clip.n);
+    clip.names = 0;
+    clip.n = 0;
+    clip.cut = 0;
+}
+
+/* how many of them are in the archive already (and would be replaced) */
+static int add_replaced(AWIN *to, ADDASK *a)
+{
+    int i, k, r = 0;
+    for (k = 0; k < to->n; k++) {
+        const char *m = to->e[k].name;
+        if (to->e[k].flags & 1)
+            continue;
+        for (i = 0; i < a->n; i++) {
+            if (!a->files) {
+                if (lc_same(m, a->names[i]))
+                    break;
+            } else {
+                char b[260];
+                size_t l;
+                sprintf(b, "%.250s", base_name(a->names[i]));
+                l = strlen(b);
+                while (l && (b[l - 1] == '\\' || b[l - 1] == '/'))
+                    b[--l] = 0;
+                if (!l)
+                    continue;
+                if (is_dir(a->names[i])) {
+                    strcat(b, "/");
+                    if (lc_prefix(m, b))
+                        break;
+                } else if (lc_same(m, b))
+                    break;
+            }
+        }
+        if (i < a->n)
+            r++;
+    }
+    return r;
+}
+
+static void add_free(ADDASK *a)
+{
+    names_free(a->names, a->n);
+    free(a);
+}
+
+static void add_run(ADDASK *a, int clr)
+{
+    AWIN *to = find_aw_task(a->th, a->ts);
+    if (to) {
+        if (a->files) {
+            queue_add(to->path, to->fmt, a->names, a->n, to);
+            if (tn > 0 && tasks[tn - 1].op == OP_ARC_ADD)
+                tasks[tn - 1].clrf = clr;
+            begin();
+        } else {
+            copy_members(a->fpath, a->ffmt, a->fh, a->fs, a->names, a->n, to, clr, a->move);
+            if (a->move && same_path(clip.path, a->fpath))
+                clip_clear();                /* they are moving: gone after */
+        }
+    }
+    add_free(a);
+}
+
+static void add_answer(int button, void *ctx)
+{
+    ADDASK *a = (ADDASK *)ctx;
+    if (button == 1)
+        add_run(a, 0);
+    else if (button == 2 && a->repl)
+        add_run(a, AJ_REPLACE);              /* Keep old */
+    else
+        add_free(a);
+}
+
+/* a: malloc'd, names its own; taken over */
+static void add_request(ADDASK *a)
+{
+    char al[300];
+    AWIN *to = find_aw_task(a->th, a->ts);
+    int r;
+    if (!to || !a->n) {
+        add_free(a);
+        return;
+    }
+    if (!cs.confirm) {
+        add_run(a, 0);
+        return;
+    }
+    r = cs.replace ? add_replaced(to, a) : 0;
+    if (r) {
+        a->repl = 1;
+        sprintf(al, "[2][%d of the %d item%s to add|%s already in|%.30s.|Replace %s?]"
+                "[Replace|Keep old|Cancel]", r, a->n, a->n == 1 ? "" : "s",
+                r == 1 ? "is" : "are", base_name(to->path), r == 1 ? "it" : "them");
+    } else if (!a->files)
+        sprintf(al, "[2][%s %d member%s of|%.30s|to %.27s?][ %s |Cancel]",
+                a->move ? "Move" : "Add", a->n, a->n == 1 ? "" : "s", base_name(a->fpath),
+                base_name(to->path), a->move ? "Move" : "Add");
+    else {
+        add_run(a, 0);                       /* new files: nothing to lose */
+        return;
+    }
+    alert_show(1, al, add_answer, a, 0);
+}
+
+static ADDASK *add_new(AWIN *to)
+{
+    ADDASK *a = (ADDASK *)calloc(1, sizeof(ADDASK));
+    if (a) {
+        a->th = to->handle;
+        a->ts = to->serial;
+    }
+    return a;
+}
+
+/* members of one archive window dropped on another */
+static void copy_ask(AWIN *from, AWIN *to)
+{
+    ADDASK *a;
+    if (from == to || from->isnew || !(a = add_new(to)))
+        return;
+    strcpy(a->fpath, from->path);
+    a->ffmt = from->fmt;
+    a->fh = from->handle;
+    a->fs = from->serial;
+    if (!(a->names = names_sel(from, &a->n))) {
+        free(a);
+        return;
+    }
+    add_request(a);
+}
+
+/* files (taken over: names[] freed after) into an archive window */
+static void add_files_ask(struct AWIN *to, char **names, int n)
+{
+    ADDASK *a = add_new(to);
+    if (!a || !(a->names = names_dup(names, n))) {
+        free(a);
+        return;
+    }
+    a->files = 1;
+    a->n = n;
+    add_request(a);
+}
+
+static void edit_copy(int cut)
+{
+    AWIN *w = top_awin();
+    if (!aw_can_extract(w, 1) || w->busy)
+        return;
+    clip_clear();
+    if (!(clip.names = names_sel(w, &clip.n)))
+        return;
+    strcpy(clip.path, w->path);
+    clip.fmt = w->fmt;
+    clip.h = w->handle;
+    clip.s = w->serial;
+    clip.cut = cut;
+    fa_menu_update();
+}
+
+static void edit_paste(void)
+{
+    AWIN *w = top_awin();
+    ADDASK *a;
+    if (!w || w->busy || !clip.n)
+        return;
+    if (same_path(clip.path, w->path)) {
+        alertf("[1][Those members are in|this archive already.][ OK ]");
+        return;
+    }
+    if (!exists(clip.path)) {
+        alertf("[1][%.30s|is not there any more.][ OK ]", base_name(clip.path));
+        clip_clear();
+        fa_menu_update();
+        return;
+    }
+    if (!(a = add_new(w)))
+        return;
+    strcpy(a->fpath, clip.path);
+    a->ffmt = clip.fmt;
+    a->fh = clip.h;
+    a->fs = clip.s;
+    a->move = clip.cut;
+    a->n = clip.n;
+    if (!(a->names = names_dup(clip.names, clip.n))) {
+        free(a);
+        return;
+    }
+    add_request(a);
+}
+
+/* the members in list (a list file, taken over) out of the archive arc */
+static void queue_delete_list(const char *arc, int afmt, const char *list, int n)
+{
+    TASK *t = task_new(OP_ARC_DELETE, arc);
+    AWIN *w = find_aw_path(arc);
+    (void)n;
+    if (!t) {
+        Fdelete(list);
+        return;
+    }
+    t->afmt = afmt;
+    strcpy(t->list, list);
+    t->nitems = 0;
+    {
+        FILE *f = fopen(list, "r");
+        char line[260];
+        if (f) {
+            while (fgets(line, sizeof line, f))
+                if (line[0] != '\n' && line[0] != '\r')
+                    t->nitems++;
+            fclose(f);
+        }
+    }
+    if (w)
+        t->handle = w->handle, t->serial = w->serial;
+}
+
+typedef struct { int h; long s; char **names; int n; } DELASK;
+
+static void delete_run(DELASK *d)
+{
+    AWIN *w = find_aw_task(d->h, d->s);
+    char list[256];
+    FILE *f;
+    int i;
+    if (w && (f = list_file(list, "w")) != 0) {
+        for (i = 0; i < d->n; i++) {
+            fputs(d->names[i], f);
+            fputs("\n", f);
+        }
+        fclose(f);
+        queue_delete_list(w->path, w->fmt, list, d->n);
+        begin();
+    }
+    names_free(d->names, d->n);
+    free(d);
+}
+
+static void delete_answer(int button, void *ctx)
+{
+    DELASK *d = (DELASK *)ctx;
+    if (button == 1)
+        delete_run(d);
+    else {
+        names_free(d->names, d->n);
+        free(d);
+    }
+}
+
+/* Edit > Rename: one member, or a folder and everything in it, gets a
+   new name in the same folder - to make an archive safe for TOS before
+   extracting it, say. The archive formats keep names inside their own
+   headers (with checksums), so the members are extracted to a temporary
+   folder and added again under the new name, the old ones taken out in
+   the same rewrite: the copy machinery, with the map file it writes
+   pointing the files at their new names.                              */
+static void rename_members(AWIN *w, const char *old, const char *nw)
+{
+    char tmp[256], dir[256], dell[256];
+    TASK *t;
+    int k, i, nn = 0;
+    size_t ol = strlen(old);
+    FILE *f, *fd;
+    for (k = 0; k < 1000; k++) {
+        sprintf(dir, "%sFARN%04d", app_folder, (int)((now_ms() / 7 + k) % 10000));
+        if (!exists(dir))
+            break;
+    }
+    if (afs_mkdir(dir) != E_OK) {
+        log_add("Cannot make a temporary folder %s", dir);
+        return;
+    }
+    sprintf(tmp, "%s\\", dir);
+    t = task_new(OP_ARC_EXTRACT, w->path);
+    if (!t) {
+        afs_rmtree(dir);
+        return;
+    }
+    strcpy(t->out, tmp);
+    t->afmt = w->fmt;
+    t->handle = w->handle;
+    t->serial = w->serial;
+    t->setf = AJ_PATHS | AJ_REPLACE | AJ_SUBDIRS;
+    t->clrf = AJ_NOMAC;                      /* all of them: all go out after */
+    t->copy_h = w->handle;                   /* back into the same archive */
+    t->copy_serial = w->serial;
+    sprintf(t->map, "%s.MAP", dir);
+    strcpy(t->rnold, old);
+    strcpy(t->rnnew, nw);
+    f = list_file(t->list, "w");
+    fd = f ? list_file(dell, "w") : 0;
+    if (!fd) {
+        if (f) {
+            fclose(f);
+            Fdelete(t->list);
+        }
+        tn--;
+        afs_rmtree(dir);
+        log_add("Cannot write a list file next to FArchive");
+        return;
+    }
+    for (i = 0; i < w->n; i++) {
+        const char *m = w->e[i].name;
+        if (!strncmp(m, old, ol) && (!m[ol] || m[ol] == '/')) {
+            if (!(w->e[i].flags & 1)) {      /* the files are extracted */
+                fputs(m, f);
+                fputs("\n", f);
+            }
+            fputs(m, fd);                    /* all of them taken out */
+            fputs("\n", fd);
+            nn++;
+        }
+    }
+    fclose(f);
+    fclose(fd);
+    strcpy(t->dell, dell);
+    t->nitems = nn;
+    log_add("Renaming %s to %s in %s", old, nw, base_name(w->path));
+    w->busy = 1;                             /* until it is read again */
+    aw_changed(w);
+    begin();
+}
+
+/* Archive > Fix 8.3 names: every file and folder name that isn't a
+   valid 8.3 name (or clashes with another in its folder once TOS has
+   made them capitals) gets one, "Long File Name.txt" -> LONGFI_1.TXT,
+   the same way FArchive renames when extracting to a FAT drive - but in
+   the archive, so it can be extracted anywhere as it is. Like Rename:
+   the members are extracted, added again under their new names and the
+   old ones taken out in the same rewrite, which happens only if all of
+   them came out. */
+
+typedef struct {
+    char **key;                              /* old parent path + "/" + old part */
+    char **nw;                               /* ... its new part             */
+    char **used;                             /* old parent path + "/" + NEW   */
+    int    n, nu, cap, capu;
+} FIXT;
+
+static int fx_add(char ***arr, int *n, int *cap, const char *s)
+{
+    if (*n == *cap) {
+        char **a = realloc(*arr, (*cap = *cap ? *cap * 2 : 64) * sizeof(char *));
+        if (!a)
+            return 0;
+        *arr = a;
+    }
+    if (!((*arr)[*n] = malloc(strlen(s) + 1)))
+        return 0;
+    strcpy((*arr)[(*n)++], s);
+    return 1;
+}
+
+static int fx_used(FIXT *x, const char *s)
+{
+    int i;
+    for (i = 0; i < x->nu; i++)
+        if (lc_same(x->used[i], s))
+            return 1;
+    return 0;
+}
+
+static void fx_free(FIXT *x)
+{
+    names_free(x->key, x->n);
+    free(x->nw);                             /* (they point into key's) */
+    x->key = x->nw = 0;
+    names_free(x->used, x->nu);
+    x->used = 0;
+}
+
+/* the new name of one part (in the folder whose old path is parent) */
+static const char *fx_part(FIXT *x, const char *parent, const char *part, int keep)
+{
+    char key[520], cand[16], u[540];
+    int i, k;
+    sprintf(key, "%.255s/%.255s", parent, part);
+    for (i = 0; i < x->n; i++)
+        if (!strcmp(x->key[i], key))
+            return x->nw[i];
+    if (keep) {                              /* valid already: as it is */
+        strcpy(cand, "");
+        sprintf(u, "%.255s/%.255s", parent, part);
+        if (!fx_used(x, u)) {
+            if (x->n == x->cap) {
+                char **a = realloc(x->key, (x->cap = x->cap ? x->cap * 2 : 64) * sizeof(char *));
+                char **b = a ? realloc(x->nw, x->cap * sizeof(char *)) : 0;
+                if (a) x->key = a;
+                if (b) x->nw = b;
+                if (!a || !b)
+                    return 0;
+            }
+            if (!fx_add(&x->used, &x->nu, &x->capu, u))
+                return 0;
+            x->key[x->n] = malloc(strlen(key) + 1);
+            if (!x->key[x->n])
+                return 0;
+            strcpy(x->key[x->n], key);
+            x->nw[x->n] = x->key[x->n] + strlen(parent) + 1;    /* the part itself */
+            return x->nw[x->n++];
+        }
+    }
+    for (k = 0; k < 1000; k++) {             /* LONGFI_1.TXT, _2, ... */
+        af_make83(part, cand, k);
+        sprintf(u, "%.255s/%s", parent, cand);
+        if (!fx_used(x, u))
+            break;
+    }
+    if (k == 1000)
+        return 0;
+    if (x->n == x->cap) {
+        char **a = realloc(x->key, (x->cap = x->cap ? x->cap * 2 : 64) * sizeof(char *));
+        char **b = a ? realloc(x->nw, x->cap * sizeof(char *)) : 0;
+        if (a) x->key = a;
+        if (b) x->nw = b;
+        if (!a || !b)
+            return 0;
+    }
+    if (!fx_add(&x->used, &x->nu, &x->capu, u))
+        return 0;
+    /* key and new part in one block: "key\0new" */
+    x->key[x->n] = malloc(strlen(key) + strlen(cand) + 2);
+    if (!x->key[x->n])
+        return 0;
+    strcpy(x->key[x->n], key);
+    x->nw[x->n] = x->key[x->n] + strlen(key) + 1;
+    strcpy(x->nw[x->n], cand);
+    return x->nw[x->n++];
+}
+
+/* a member's new path; 0 if it can't be made */
+static int fx_path(FIXT *x, const char *old, char *out)
+{
+    char parent[300], part[256];
+    const char *p = old, *e, *np;
+    parent[0] = out[0] = 0;
+    while (*p) {
+        size_t n;
+        for (e = p; *e && *e != '/'; e++) ;
+        n = (size_t)(e - p);
+        if (n >= sizeof part || strlen(out) + n + 14 >= 256)
+            return 0;
+        memcpy(part, p, n);
+        part[n] = 0;
+        if (n) {
+            np = fx_part(x, parent, part, af_valid83(part));
+            if (!np)
+                return 0;
+            if (out[0])
+                strcat(out, "/");
+            strcat(out, np);
+            if (parent[0])
+                strcat(parent, "/");
+            strcat(parent, part);
+        }
+        p = *e ? e + 1 : e;
+    }
+    return 1;
+}
+
+typedef struct { int h; long s; int n; char tab[256], list[256], dell[256]; } FIXASK;
+
+static void fix83_run(FIXASK *f)
+{
+    AWIN *w = find_aw_task(f->h, f->s);
+    char tmp[256], dir[256];
+    TASK *t;
+    int k;
+    if (!w || w->busy) {
+        Fdelete(f->tab);
+        Fdelete(f->list);
+        Fdelete(f->dell);
+        free(f);
+        return;
+    }
+    for (k = 0; k < 1000; k++) {
+        sprintf(dir, "%sFARN%04d", app_folder, (int)((now_ms() / 7 + k) % 10000));
+        if (!exists(dir))
+            break;
+    }
+    if (afs_mkdir(dir) != E_OK || !(t = task_new(OP_ARC_EXTRACT, w->path))) {
+        log_add("Cannot make a temporary folder %s", dir);
+        Fdelete(f->tab);
+        Fdelete(f->list);
+        Fdelete(f->dell);
+        free(f);
+        return;
+    }
+    sprintf(tmp, "%s\\", dir);
+    strcpy(t->out, tmp);
+    t->afmt = w->fmt;
+    t->handle = w->handle;
+    t->serial = w->serial;
+    t->setf = AJ_PATHS | AJ_REPLACE | AJ_SUBDIRS;
+    t->clrf = AJ_NOMAC;
+    t->copy_h = w->handle;
+    t->copy_serial = w->serial;
+    sprintf(t->map, "%s.MAP", dir);
+    t->rnold[0] = 1;                         /* a table, not one rename */
+    t->rnold[1] = 0;
+    strcpy(t->rnnew, f->tab);
+    strcpy(t->list, f->list);
+    strcpy(t->dell, f->dell);
+    t->nitems = f->n;
+    log_add("Fixing %d name%s in %s", f->n, f->n == 1 ? "" : "s", base_name(w->path));
+    w->busy = 1;
+    aw_changed(w);
+    free(f);
+    begin();
+}
+
+static void fix83_answer(int button, void *ctx)
+{
+    FIXASK *f = (FIXASK *)ctx;
+    if (button == 1)
+        fix83_run(f);
+    else {
+        Fdelete(f->tab);
+        Fdelete(f->list);
+        Fdelete(f->dell);
+        free(f);
+    }
+}
+
+static void fix83(struct AWIN *w)
+{
+    FIXT x;
+    FIXASK *f;
+    FILE *ft = 0, *fl = 0, *fd = 0;
+    char nw[300], al[300];
+    int i, j, nfix = 0, nfiles = 0, shown = 0, err = 0;
+    if (!aw_editable(w, 0) || w->isnew)
+        return;
+    if (w->fmt == AF_GZ || w->fmt == AF_ARC) {
+        alertf("[1][%s archives keep 8.3 names|(or one file) already.][ OK ]", af_name(w->fmt));
+        return;
+    }
+    if (w->filt[0]) {                        /* the whole archive */
+        w->filt[0] = 0;
+        aw_refilter(w);
+    }
+    memset(&x, 0, sizeof x);
+    if (!(f = (FIXASK *)calloc(1, sizeof *f)))
+        return;
+    ft = list_file(f->tab, "w");
+    fl = ft ? list_file(f->list, "w") : 0;
+    fd = fl ? list_file(f->dell, "w") : 0;
+    if (!fd) {
+        if (ft) { fclose(ft); Fdelete(f->tab); }
+        if (fl) { fclose(fl); Fdelete(f->list); }
+        free(f);
+        log_add("Cannot write a list file next to FArchive");
+        return;
+    }
+    /* first the names that are fine are taken as they are, so a new
+       name never takes one of theirs; then the new names            */
+    for (i = 0; i < w->n && !err; i++) {
+        const char *p = w->e[i].name, *e;
+        char parent[300], part[256];
+        if (cs.nomac && af_mac_meta(p))
+            continue;
+        parent[0] = 0;
+        while (*p) {
+            size_t n;
+            for (e = p; *e && *e != '/'; e++) ;
+            n = (size_t)(e - p);
+            if (n && n < sizeof part) {
+                char u[540];
+                memcpy(part, p, n);
+                part[n] = 0;
+                if (af_valid83(part)) {
+                    sprintf(u, "%.255s/%.255s", parent, part);
+                    if (!fx_used(&x, u))
+                        fx_part(&x, parent, part, 1);
+                }
+                if (parent[0])
+                    strcat(parent, "/");
+                if (strlen(parent) + n < sizeof parent - 1)
+                    strcat(parent, part);
+            }
+            p = *e ? e + 1 : e;
+        }
+    }
+    for (i = 0; i < w->n && !err; i++) {
+        const char *m = w->e[i].name;
+        if (cs.nomac && af_mac_meta(m))
+            continue;
+        if (!fx_path(&x, m, nw)) {
+            err = 1;
+            break;
+        }
+        if (strcmp(nw, m)) {
+            if (!(w->e[i].flags & 1)) {
+                fprintf(fl, "%s\n", m);
+                nfiles++;
+            } else {                         /* a folder: only with files in it */
+                size_t ml = strlen(m);
+                for (j = 0; j < w->n; j++)
+                    if (!(w->e[j].flags & 1) && !strncmp(w->e[j].name, m, ml) &&
+                        w->e[j].name[ml] == '/')
+                        break;
+                if (j == w->n) {
+                    log_add("  %s: an empty folder, left as it is", m);
+                    continue;
+                }
+            }
+            fprintf(ft, "%s\t%s\n", m, nw);
+            fprintf(fd, "%s\n", m);
+            if (shown++ < 40)
+                log_add("  %s -> %s", m, nw);
+            nfix++;
+        }
+    }
+    fx_free(&x);
+    fclose(ft);
+    fclose(fl);
+    fclose(fd);
+    if (err || !nfiles) {
+        Fdelete(f->tab);
+        Fdelete(f->list);
+        Fdelete(f->dell);
+        free(f);
+        if (err)
+            alertf("[1][FArchive: couldn't work out|new names (too many, or out|of memory).][ OK ]");
+        else
+            alertf("[1][Every name in|%.30s|is a valid 8.3 name.][ OK ]", base_name(w->path));
+        return;
+    }
+    if (shown > 40)
+        log_add("  ... and %d more", shown - 40);
+    f->h = w->handle;
+    f->s = w->serial;
+    f->n = nfix;
+    /* always asked: it changes many names at once */
+    sprintf(al, "[2][Give %d name%s in|%.30s|8.3 names? (listed in the log)][ Fix |Cancel]",
+            nfix, nfix == 1 ? "" : "s", base_name(w->path));
+    show_log();
+    alert_show(2, al, fix83_answer, f, 0);
+}
+
+typedef struct { int handle; long serial; int full; char old[256]; } RENFOR;
+static WDIALOG *rn_dlg;
+
+#define RN_MAX 64                            /* the field: longer paths name
+                                                just the last part       */
+
+/* split a path at its slashes: parts point into buf */
+static int path_parts(const char *path, char *buf, char **part, int max)
+{
+    int n = 0;
+    char *p;
+    strcpy(buf, path);
+    for (p = buf; n < max; ) {
+        part[n++] = p;
+        p = strchr(p, '/');
+        if (!p)
+            break;
+        *p++ = 0;
+    }
+    return n;
+}
+
+static int rn_bad_name(const char *nb)
+{
+    return !*nb || strpbrk(nb, "\\:*?\"<>|") || !strcmp(nb, ".") || !strcmp(nb, "..") ||
+           nb[0] == ' ' || nb[strlen(nb) - 1] == ' ';
+}
+
+static int rn_exit(WDIALOG *d, int obj)
+{
+    RENFOR *rf = (RENFOR *)wd_ctx(d);
+    rn_dlg = 0;
+    if (obj == RN_OK) {
+        const char *typed = wd_field(d, RN_FIELD);
+        AWIN *w = find_aw_task(rf->handle, rf->serial);
+        char from[300], to[300], ob[300], nb[300], *op[32], *np[32];
+        int i, no, nn, k, diff = -1, ndiff = 0;
+        if (!w || w->busy || !typed) {
+            free(rf);
+            return 1;
+        }
+        if (rf->full) {
+            /* the whole path was shown: which one part changed? */
+            no = path_parts(rf->old, ob, op, 32);
+            nn = path_parts(typed, nb, np, 32);
+            if (no != nn) {
+                alertf("[1][Change one name in the path:|folders can't be added|or taken away here.][ OK ]");
+                free(rf);
+                return 1;
+            }
+            for (k = 0; k < no; k++)
+                if (strcmp(op[k], np[k])) {
+                    diff = k;
+                    ndiff++;
+                }
+        } else {                             /* just the last part shown */
+            no = path_parts(rf->old, ob, op, 32);
+            np[0] = (char *)typed;
+            diff = strcmp(op[no - 1], typed) ? no - 1 : -1;
+            ndiff = diff >= 0;
+            if (diff >= 0)
+                np[diff] = (char *)typed;
+        }
+        if (ndiff > 1)
+            alertf("[1][Change one name at a time:|the file's or one folder's.][ OK ]");
+        else if (ndiff == 1) {
+            const char *newpart = rf->full ? np[diff] : typed;
+            if (rn_bad_name(newpart) || strchr(newpart, '/')) {
+                alertf("[1][A name can't be empty or|have \\ : * ? \" < > or | in it.][ OK ]");
+            } else {
+                /* from: the path up to the part that changed; to: the same
+                   with the new name in its place                         */
+                from[0] = to[0] = 0;
+                for (k = 0; k <= diff; k++) {
+                    if (k) {
+                        strcat(from, "/");
+                        strcat(to, "/");
+                    }
+                    strcat(from, op[k]);
+                    strcat(to, k == diff ? newpart : op[k]);
+                }
+                for (i = 0; i < w->n; i++) {
+                    const char *m = w->e[i].name;
+                    size_t tl = strlen(to);
+                    if (lc_same(m, from) || (lc_prefix(m, from) && m[strlen(from)] == '/'))
+                        continue;            /* itself (a change of case) */
+                    if (lc_same(m, to) || (lc_prefix(m, to) && m[tl] == '/'))
+                        break;
+                }
+                if (i < w->n)
+                    alertf("[1][%.30s|is in the archive already.][ OK ]", newpart);
+                else
+                    rename_members(w, from, to);
+            }
+        }
+    }
+    free(rf);
+    return 1;
+}
+
+static void do_rename(void)
+{
+    AWIN *w = top_awin();
+    RENFOR *rf;
+    int i;
+    if (!aw_editable(w, 2) || aw_count_sel(w) != 1)
+        return;
+    for (i = 0; i < w->n && !w->e[i].sel; i++)
+        ;
+    if (i >= w->n)
+        return;
+    if (rn_dlg) {                            /* one at a time */
+        free(wd_ctx(rn_dlg));
+        wd_close(rn_dlg);
+    }
+    rn_dlg = 0;
+    if (!(rf = (RENFOR *)malloc(sizeof *rf)))
+        return;
+    rf->handle = w->handle;
+    rf->serial = w->serial;
+    sprintf(rf->old, "%.250s", w->e[i].name);
+    {
+        size_t l = strlen(rf->old);
+        while (l && rf->old[l - 1] == '/')
+            rf->old[--l] = 0;
+    }
+    rn_dlg = wd_open(T_RENAME, rs(S_W_RENAME), RN_FIELD, rn_exit, 0, rf);
+    if (!rn_dlg) {
+        free(rf);
+        return;
+    }
+    if (strlen(rf->old) < RN_MAX) {          /* the path: any part can change */
+        rf->full = 1;
+        wd_set_field(rn_dlg, RN_FIELD, rf->old);
+    } else {
+        const char *b = strrchr(rf->old, '/');
+        rf->full = 0;
+        wd_set_field(rn_dlg, RN_FIELD, b ? b + 1 : rf->old);
+    }
+}
+
+/* Edit > Delete: the selected members, after asking */
+static void do_delete(void)
+{
+    AWIN *w = top_awin();
+    DELASK *d;
+    char al[200];
+    if (!aw_can_extract(w, 1) || w->busy)
+        return;
+    if (w->fmt == AF_GZ) {
+        alertf("[1][A GZ file holds one file:|nothing can be deleted|from it.][ OK ]");
+        return;
+    }
+    if (!(d = (DELASK *)calloc(1, sizeof *d)))
+        return;
+    d->h = w->handle;
+    d->s = w->serial;
+    if (!(d->names = names_sel(w, &d->n))) {
+        free(d);
+        return;
+    }
+    if (!cs.confirm) {
+        delete_run(d);
+        return;
+    }
+    sprintf(al, "[3][Delete %d member%s from|%.30s?|This can't be undone.][Delete|Cancel]",
+            d->n, d->n == 1 ? "" : "s", base_name(w->path));
+    alert_show(2, al, delete_answer, d, 0);
+}
+
+/* Pressed on a selected member: if the mouse moves with the button held,
+   an outline follows it; let go over another archive window and the
+   selection is copied there. 1 if it was a drag (whatever came of it). */
+static int aw_drag(AWIN *w, int mx, int my)
+{
+    short x, y, b, k, pxy[10], ox, oy;
+    int bw = 22 * cell_w, bh = cell_h + 4, moved = 0, h;
+    int ux0 = 32767, uy0 = 32767, ux1 = -1, uy1 = -1;   /* where outlines went */
+    AWIN *to;
+    graf_mkstate(&x, &y, &b, &k);
+    if (!(b & 1))
+        return 0;
+    wind_update(BEG_UPDATE);
+    wind_update(BEG_MCTRL);
+    /* a solid XOR outline: drawn twice it is gone. (A dotted one isn't:
+       the VDI carries the dash pattern on from line to line, and the
+       FreeGEM 256-colour drivers draw patterned lines in the wrong places.) */
+    vswr_mode(vdih, MD_XOR);
+    vsl_color(vdih, 1);
+    vsl_type(vdih, 1);
+    vsl_width(vdih, 1);
+    vs_clip(vdih, 0, pxy);
+    ox = oy = -1;
+    for (;;) {
+        graf_mkstate(&x, &y, &b, &k);
+        if (!moved && (x - mx > 3 || mx - x > 3 || y - my > 3 || my - y > 3)) {
+            moved = 1;
+            graf_mouse(FLAT_HAND, 0);
+        }
+        if (moved && (x != ox || y != oy)) {
+            graf_mouse(M_OFF, 0);
+            if (ox >= 0) {                   /* take the old outline away */
+                pxy[0] = ox; pxy[1] = oy; pxy[2] = ox + bw; pxy[3] = oy;
+                pxy[4] = ox + bw; pxy[5] = oy + bh; pxy[6] = ox; pxy[7] = oy + bh;
+                pxy[8] = ox; pxy[9] = oy + 1;
+                v_pline(vdih, 5, pxy);
+            }
+            ox = x - bw / 2; oy = y - bh / 2;
+            if (ox < ux0) ux0 = ox;
+            if (oy < uy0) uy0 = oy;
+            if (ox + bw > ux1) ux1 = ox + bw;
+            if (oy + bh > uy1) uy1 = oy + bh;
+            pxy[0] = ox; pxy[1] = oy; pxy[2] = ox + bw; pxy[3] = oy;
+            pxy[4] = ox + bw; pxy[5] = oy + bh; pxy[6] = ox; pxy[7] = oy + bh;
+            pxy[8] = ox; pxy[9] = oy + 1;
+            v_pline(vdih, 5, pxy);
+            graf_mouse(M_ON, 0);
+        }
+        if (!(b & 1))
+            break;
+        evnt_timer(20);
+    }
+    if (ox >= 0) {
+        graf_mouse(M_OFF, 0);
+        pxy[0] = ox; pxy[1] = oy; pxy[2] = ox + bw; pxy[3] = oy;
+        pxy[4] = ox + bw; pxy[5] = oy + bh; pxy[6] = ox; pxy[7] = oy + bh;
+        pxy[8] = ox; pxy[9] = oy + 1;
+        v_pline(vdih, 5, pxy);
+        graf_mouse(M_ON, 0);
+    }
+    vswr_mode(vdih, MD_REPLACE);
+    graf_mouse(ARROW, 0);
+    wind_update(END_MCTRL);
+    wind_update(END_UPDATE);
+    /* and to be sure: everything the outline passed over is drawn again */
+    if (ux1 >= 0) {
+        GRECT a;
+        a.g_x = ux0 - 2; a.g_y = uy0 - 2;
+        a.g_w = ux1 - ux0 + 5; a.g_h = uy1 - uy0 + 5;
+        if (rc_intersect(&desk, &a))
+            form_dial(FMD_FINISH, 0, 0, 0, 0, a.g_x, a.g_y, a.g_w, a.g_h);
+    }
+    if (!moved)
+        return 0;
+    h = wind_find(x, y);
+    to = 0;
+    {
+        int i;
+        for (i = 0; i < MAXAW; i++)
+            if (aw[i].handle > 0 && aw[i].handle == h)
+                to = &aw[i];
+    }
+    if (to && to != w)
+        copy_ask(w, to);
+    return 1;
+}
+
 static void aw_click(AWIN *w, int mx, int my, int clicks, int ks)
 {
     GRECT wk;
-    int row, i;
+    int row, i, vr;
     wind_get_grect(w->handle, WF_WORKXYWH, &wk);
     if (my < wk.g_y + cell_h + 4) {
         wind_set(w->handle, WF_TOP, 0, 0, 0, 0);
         return;
     }
-    row = (int)w->top + (my - wk.g_y - cell_h - 4) / cell_h;
-    (void)mx;
-    if (row < 0 || row >= w->n) {
+    vr = (int)w->top + (my - wk.g_y - cell_h - 4) / cell_h;
+    if (vr < 0 || vr >= w->nv || !w->vis) {
         if (!(ks & (K_LSHIFT | K_RSHIFT | K_CTRL)))
             select_all(w, 0);
         return;
     }
-    if ((ks & K_CTRL) && w->anchor >= 0 && w->anchor < w->n) {
-        int a = w->anchor < row ? w->anchor : row, b = w->anchor < row ? row : w->anchor;
+    row = w->vis[vr];                        /* the member on that row */
+    /* a press on a selected member, nothing held: maybe a drag to another
+       archive window (the selection stays as it is) */
+    if (clicks == 1 && !(ks & (K_LSHIFT | K_RSHIFT | K_CTRL)) && w->e[row].sel &&
+        aw_drag(w, mx, my))
+        return;
+    if ((ks & K_CTRL) && w->anchor >= 0 && w->anchor < w->n && w->rowof[w->anchor] >= 0) {
+        int ra = w->rowof[w->anchor];
+        int a = ra < vr ? ra : vr, b = ra < vr ? vr : ra;
         for (i = a; i <= b; i++)
-            w->e[i].sel = 1;
+            w->e[w->vis[i]].sel = 1;
     } else if (ks & (K_LSHIFT | K_RSHIFT)) {
         w->e[row].sel = !w->e[row].sel;
     } else {
@@ -2452,6 +4372,7 @@ static void aw_click(AWIN *w, int mx, int my, int clicks, int ks)
     }
     if (!(ks & K_CTRL))
         w->anchor = row;
+    w->cur = row;
     aw_changed(w);
     if (clicks >= 2 && !(w->e[row].flags & 2)) {
         for (i = 0; i < w->n; i++)
@@ -2465,6 +4386,12 @@ static void button(int mx, int my, int clicks, int ks)
 {
     int h = wind_find(mx, my);
     AWIN *w;
+    if (wd_button(h, mx, my, clicks))        /* a dialog window's */
+        return;
+    if (lw.handle > 0 && h == lw.handle) {   /* the 8.3 list: just to the front */
+        wind_set(lw.handle, WF_TOP, 0, 0, 0, 0);
+        return;
+    }
     if (pdlg > 0 && h == pdlg) {
         dlg_place();
         if (objc_find(ptree, 0, 8, mx, my) == P_BTN && !(ptree[P_BTN].ob_state & SELECTED))
@@ -2484,16 +4411,80 @@ static void button(int mx, int my, int clicks, int ks)
     }
 }
 
+/* the cursor keys move a selection along the list; with Shift they
+   select everything from the last row clicked (or moved to without
+   Shift) to the new one, as in a file selector */
+static int aw_cursor(AWIN *w, int ks, int scan)
+{
+    int i, to, from, a, b, page, ra;
+    if (!w || w->busy || w->nv <= 0 || !w->vis)
+        return 0;
+    page = aw_rows(w) > 1 ? aw_rows(w) - 1 : 1;
+    from = w->cur >= 0 && w->cur < w->n ? w->rowof[w->cur] : -1;
+    switch (scan) {
+    case 0x48: to = from < 0 ? w->nv - 1 : from - 1; break;      /* up      */
+    case 0x50: to = from < 0 ? 0 : from + 1; break;               /* down    */
+    case 0x49: to = (from < 0 ? w->nv : from) - page; break;      /* page up */
+    case 0x51: to = (from < 0 ? -1 : from) + page; break;         /* page dn */
+    case 0x47: to = 0; break;                                     /* home    */
+    case 0x4F: to = w->nv - 1; break;                             /* end     */
+    default: return 0;
+    }
+    if (to < 0) to = 0;
+    if (to >= w->nv) to = w->nv - 1;
+    if (ks & (K_LSHIFT | K_RSHIFT)) {
+        ra = w->anchor >= 0 && w->anchor < w->n ? w->rowof[w->anchor] : -1;
+        if (ra < 0) {
+            ra = from >= 0 ? from : to;
+            w->anchor = w->vis[ra];
+        }
+        a = ra < to ? ra : to;
+        b = ra < to ? to : ra;
+        for (i = 0; i < w->n; i++)
+            w->e[i].sel = 0;
+        for (i = a; i <= b; i++)
+            w->e[w->vis[i]].sel = 1;
+    } else {
+        for (i = 0; i < w->n; i++)
+            w->e[i].sel = 0;
+        w->e[w->vis[to]].sel = 1;
+        w->anchor = w->vis[to];
+    }
+    w->cur = w->vis[to];
+    {
+        int keep = w->anchor;
+        aw_show_row(w, w->vis[to]);          /* (it sets the anchor) */
+        w->anchor = keep;
+    }
+    aw_changed(w);
+    return 1;
+}
+
 static void key(int ks, int k)
 {
     int c = k & 0xFF;
-    (void)ks;
+    if (wd_key(ks, k))                       /* a dialog's field or buttons */
+        return;
+    if (!(ks & K_CTRL) && aw_cursor(top_awin(), ks, (k >> 8) & 0xFF))
+        return;
     if (c == 15) do_open();                  /* ^O */
     else if (c == 14) do_new();              /* ^N */
     else if (c == 5) do_extract_file();      /* ^E */
-    else if (c == 24) do_extract_sel();      /* ^X */
+    else if (c == 20) do_extract_sel();      /* ^T */
+    else if (c == 24) edit_copy(1);          /* ^X: cut */
+    else if (c == 3) edit_copy(0);           /* ^C */
+    else if (c == 22) edit_paste();          /* ^V */
+    else if (c == 18) do_rename();           /* ^R */
+    else if (c == 12) do_filter(top_awin()); /* ^L */
+    else if (((k >> 8) & 0xFF) == 0x53 || c == 0x7F) do_delete();     /* Delete */
+    else if (c == 25) do_extract_all();      /* ^Y */
+    else if (c == 6) do_find(top_awin());    /* ^F */
+    else if (c == 11) check83(top_awin());   /* ^K */
+    else if (c == 10) fix83(top_awin());     /* ^J */
+    else if (c == 7) find_next(top_awin());  /* ^G */
     else if (c == 1) do_add_files();         /* ^A */
     else if (c == 19) select_all(top_awin(), 1);     /* ^S */
+    else if (c == 26) select_all(top_awin(), 0);     /* ^Z */
     else if (c == 21) { AWIN *w = top_awin(); if (w) aw_close(w); }   /* ^U */
     else if (c == 4) { choose_dest(); changed(); }   /* ^D */
     else if (c == 17) quitting = 1;          /* ^Q */
@@ -2531,6 +4522,15 @@ int gui_coop_poll(void)
 }
 
 /* ----------------------------------------------------------------- main */
+
+/* the AES draws check boxes and round radio buttons itself (MagiC) */
+static int detect_xbutton(void)
+{
+    short o1 = 0, o2 = 0, o3 = 0, o4 = 0;
+    if (_AESversion < 0x0400 && appl_find("?AGI") < 0)
+        return 0;                            /* no appl_getinfo */
+    return appl_getinfo(13, &o1, &o2, &o3, &o4) && (o4 & 4);
+}
 
 static int detect_3d(void)
 {
@@ -2597,6 +4597,14 @@ int main(int argc, char **argv)
     job_init_system();
     aes_iconify = detect_iconify();
     aes_3d = detect_3d();
+    aes_xbutton = detect_xbutton();
+#ifndef PCGEM
+    if (aes_3d && scr_planes >= 4) {         /* TOS 4's grey; white in 2 colours */
+        short c = -1, d2;
+        if (objc_sysvar(0, 4 /* BACKGRCOL */, 0, 0, &c, &d2) && c > 0)
+            bg3d = c;
+    }
+#endif
     dbg("AES %04x screen %dx%d planes %d, format %d dest '%s'",
         _AESversion, scr_w, scr_h, scr_planes, cs.fmt, cs.dest);
 
@@ -2605,7 +4613,15 @@ int main(int argc, char **argv)
     if (_AESnumapps != 1 || _AESversion >= 0x0400)
         menu_register(ap_id, "  FArchive");
 
-    fa_build_menu();
+    if (!rsc_open("FARCHIVE", LANG_EN)) {
+        form_alert(1, "[3][FArchive: FARCHIVE.RSC|is missing.][ Quit ]");
+        v_clsvwk(vdih);
+        appl_exit();
+        return 1;
+    }
+    wd_alert_tree = T_ALERT;
+    wd_app_title = " FArchive ";
+    menu = rs_tree(T_MENU);
     menu_bar(menu, 1);
     fa_menu_update();
     fa_build_icon();
@@ -2637,6 +4653,8 @@ int main(int argc, char **argv)
     for (i = tpos; i < tn; i++)              /* tasks never started */
         if (tasks[i].list[0])
             Fdelete(tasks[i].list);
+    wd_close_all();
+    lw_close();
     dlg_close();
     for (i = 0; i < MAXAW; i++)
         if (aw[i].handle > 0)

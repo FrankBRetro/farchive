@@ -39,7 +39,7 @@ static int do_list(JOBREQ *q, JOBRES *r)
     ARCH a;
     long size = 18, i;
     u8 *b, *p;
-    int e = arch_open(&a, q->path);
+    int e = arch_open_as(&a, q->path, q->afmt);
     if (e) {
         arch_close(&a);
         return e;
@@ -86,6 +86,7 @@ static void set_opts(AOPT *o, JOBREQ *q, PROG *pg)
     o->rename83 = (q->aflags & AJ_RENAME83) != 0;
     o->subdirs = (q->aflags & AJ_SUBDIRS) != 0;
     o->paths = (q->aflags & AJ_PATHS) != 0;
+    o->nomac = (q->aflags & AJ_NOMAC) != 0;
     o->level = q->aflags & AJ_FAST ? 1 : q->aflags & AJ_BEST ? 3 : 2;
     o->pg = pg;
 }
@@ -95,7 +96,7 @@ static int do_extract(JOBREQ *q, JOBRES *r, PROG *pg)
     ARCH a;
     AOPT o;
     u8 *sel = 0;
-    int e = arch_open(&a, q->path);
+    int e = arch_open_as(&a, q->path, q->afmt);
     if (e) {
         arch_close(&a);
         return e;
@@ -121,7 +122,11 @@ static int do_extract(JOBREQ *q, JOBRES *r, PROG *pg)
             fclose(f);
     }
     set_opts(&o, q, pg);
+    if (q->map[0])
+        o.mapw = fopen(q->map, "w");
     e = arch_extract(&a, q->out, sel, &o);
+    if (o.mapw)
+        fclose(o.mapw);
     r->acount[0] = o.nok;
     r->acount[1] = o.nfail;
     r->acount[2] = o.nskip;
@@ -131,14 +136,15 @@ static int do_extract(JOBREQ *q, JOBRES *r, PROG *pg)
     return e;
 }
 
-static int do_add(JOBREQ *q, JOBRES *r, PROG *pg)
+/* a file of names, one a line, into a malloc'd array */
+static char **read_names(const char *path, int *pn)
 {
-    AOPT o;
-    FILE *f = fopen(q->list, "r");
+    FILE *f = fopen(path, "r");
     char line[260], **files = 0;
-    int n = 0, cap = 0, e, i;
+    int n = 0, cap = 0;
+    *pn = 0;
     if (!f)
-        return E_OPEN;
+        return 0;
     while (fgets(line, sizeof line, f)) {
         size_t l = strlen(line);
         while (l && (line[l - 1] == '\n' || line[l - 1] == '\r'))
@@ -157,15 +163,49 @@ static int do_add(JOBREQ *q, JOBRES *r, PROG *pg)
         strcpy(files[n++], line);
     }
     fclose(f);
+    *pn = n;
+    return files;
+}
+
+static void free_names(char **files, int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        free(files[i]);
+    free(files);
+}
+
+/* Adding: q->list names the files. Deleting: q->list names the members.
+   Adding with q->out set (a rename): out names members to take out in
+   the same rewrite. */
+static int do_add(JOBREQ *q, JOBRES *r, PROG *pg)
+{
+    AOPT o;
+    char **files, **dels = 0;
+    int n, nd = 0, e;
+    files = read_names(q->list, &n);
+    if (!files && !n)
+        return E_OPEN;
     set_opts(&o, q, pg);
-    e = arch_add(q->path, q->afmt, files, n, &o);
+    o.mapr = q->map[0] ? q->map : 0;
+    if (q->op == OP_ARC_DELETE) {      /* the list names members to delete */
+        o.del = files;
+        o.ndel = n;
+        e = arch_add(q->path, q->afmt, 0, 0, &o);
+    } else {
+        if (q->out[0]) {
+            dels = read_names(q->out, &nd);
+            o.del = dels;
+            o.ndel = nd;
+        }
+        e = arch_add(q->path, q->afmt, files, n, &o);
+    }
     r->acount[0] = o.nok;
     r->acount[1] = o.nfail;
     r->acount[2] = o.nskip;
     r->acount[3] = o.nren;
-    for (i = 0; i < n; i++)
-        free(files[i]);
-    free(files);
+    free_names(files, n);
+    free_names(dels, nd);
     return e;
 }
 
@@ -178,6 +218,7 @@ int job_exec(JOBREQ *q, JOBRES *r, PROG *pg)
     case OP_ARC_LIST:    e = do_list(q, r); break;
     case OP_ARC_EXTRACT: e = do_extract(q, r, pg); break;
     case OP_ARC_ADD:     e = do_add(q, r, pg); break;
+    case OP_ARC_DELETE:  e = do_add(q, r, pg); break;     /* a rewrite without them */
     default:             e = E_UNSUP;
     }
     if (pg->cancelled)

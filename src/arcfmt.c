@@ -779,7 +779,7 @@ int arcf_add(AW *w, AITEM *it)
                 dot = strchr(base, '.');
                 if (dot) *dot = 0;
                 base[6] = 0;
-                sprintf(base + strlen(base), "~%d", n++);
+                sprintf(base + strlen(base), "_%d", n++);
                 dot = strchr(nm, '.');
                 if (dot)
                     strcat(base, dot);

@@ -5,7 +5,8 @@
 
 #include "fview.h"
 
-enum { OP_LOAD = 1, OP_RENDER, OP_CONVERT, OP_ARC_LIST, OP_ARC_EXTRACT, OP_ARC_ADD };
+enum { OP_LOAD = 1, OP_RENDER, OP_CONVERT, OP_ARC_LIST, OP_ARC_EXTRACT, OP_ARC_ADD,
+       OP_ARC_DELETE };
 enum { K_NONE = 0, K_IMAGE, K_TEXT, K_PDF, K_MAIN, K_ARCLIST };
 
 typedef struct {
@@ -42,8 +43,12 @@ typedef struct {
     int   afmt;                  /* AF_* for a new archive               */
     int   aflags;                /* AJ_* below                           */
     char  list[256];             /* file of names (add) / selection (extract) */
+    char  map[256];              /* copying between archives: extracting
+                                    writes "file<TAB>original name" here, adding
+                                    reads it back (FAT renamed them to 8.3) */
 } JOBREQ;
-enum { AJ_REPLACE = 1, AJ_RENAME83 = 2, AJ_SUBDIRS = 4, AJ_PATHS = 8, AJ_FAST = 16, AJ_BEST = 32 };
+enum { AJ_REPLACE = 1, AJ_RENAME83 = 2, AJ_SUBDIRS = 4, AJ_PATHS = 8, AJ_FAST = 16, AJ_BEST = 32,
+       AJ_NOMAC = 64 };
 
 typedef struct JOB {
     JOBREQ q;
@@ -87,5 +92,7 @@ void *shm_attach(const char *name, int del);
 void  dbg_init(const char *path, const char *who);
 void  dbg(const char *fmt, ...);
 #define LOG_ENV "FVLOG"
+
+void job_app_dir(char *dir);     /* the program's folder, ends in \\ */
 
 #endif
