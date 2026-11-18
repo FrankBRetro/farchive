@@ -202,11 +202,23 @@ static int aw_count_sel(struct AWIN *w);
 static int clip_has(void);
 static int aw_editable(struct AWIN *w, int how);
 static void add_files_ask(struct AWIN *to, char **names, int n);
+static int drop_row = -1;                   /* files dropped on this row  */
 static void edit_copy(int cut);
 static void edit_paste(void);
 static void do_delete(void);
 static void do_rename(void);
 static int aw_filtered(struct AWIN *w);
+static int aw_flat(struct AWIN *w);
+static int aw_row_at(struct AWIN *w, int x, int y);
+static void aw_go(struct AWIN *w, const char *dir);
+static void aw_up(struct AWIN *w);
+static void aw_open_row(struct AWIN *w, int row);
+static void move_into(struct AWIN *w, int row);
+static void queue_rename(struct AWIN *w, const char *list, int n);
+static void row_folder(struct AWIN *w, int row, char *out);
+static void move_names(struct AWIN *w, char **names, int n, const char *strip, const char *dir);
+static u8 *aw_sel_snapshot(struct AWIN *w);
+static void aw_sel_done(struct AWIN *w, u8 *before, long oldtop);
 static void fix83(struct AWIN *w);
 static char find_pat[41];                   /* Archive > Find: what to look for */
 
@@ -230,6 +242,9 @@ static void fa_menu_update(void)
     menu_ienable(menu, MI_FIND, aw_can_extract(t, 0));
     menu_ienable(menu, MI_FILTER, aw_can_extract(t, 0));
     menu_icheck(menu, MI_FILTER, aw_filtered(t));
+    menu_ienable(menu, MI_FLAT, aw_can_extract(t, 0));
+    menu_icheck(menu, MI_FLAT, t && aw_flat(t));
+    menu_ienable(menu, MI_LIST, aw_can_extract(t, 0));
     menu_ienable(menu, MI_FNEXT, aw_can_extract(t, 0) && find_pat[0]);
     menu_ienable(menu, MI_ADD, t != 0);
     menu_ienable(menu, MI_SELALL, t != 0);
@@ -238,7 +253,7 @@ static void fa_menu_update(void)
     menu_ienable(menu, MI_COPY, aw_editable(t, 1));
     menu_ienable(menu, MI_PASTE, aw_editable(t, 0) && clip_has());
     menu_ienable(menu, MI_DELETE, aw_editable(t, 2));
-    menu_ienable(menu, MI_RENAME, aw_editable(t, 2) && aw_count_sel(t) == 1);
+    menu_ienable(menu, MI_RENAME, aw_editable(t, 1) && aw_count_sel(t) == 1);
     menu_ienable(menu, MI_CLOSE, t != 0);
 }
 
@@ -385,10 +400,14 @@ typedef struct {
     char *name;
     long  usize, csize;
     u32   dt;
-    u8    flags;                             /* 1 folder, 2 unsupported   */
+    u8    flags;                             /* MF_* below                */
     u8    sel;
     char  m[9];
 } MEMB;
+#define MF_DIR  1                            /* a folder                  */
+#define MF_UNS  2                            /* method not supported      */
+#define MF_IMPL 4                            /* a folder only in members' paths */
+#define MF_UP   8                            /* the ".." row (e[n])       */
 
 #define MAXAW 8
 typedef struct AWIN {
@@ -405,6 +424,9 @@ typedef struct AWIN {
     int  *vis, *rowof, nv;                   /* rows shown: member indices,
                                                 each member's row (-1)    */
     char  filt[41];                          /* Archive > Filter          */
+    char  cwd[256];                          /* the folder shown ("" top) */
+    int   flat;                              /* all folders in one list   */
+    int   nreal;                             /* members (no made-up folders) */
     int   busy;                              /* a task is using it        */
     int   stale;                             /* read it again (cancelled) */
     long  serial;                            /* which window, for tasks   */
@@ -461,7 +483,57 @@ static void aw_free_list(AWIN *w)
     free(w->rowof);
     w->vis = w->rowof = 0;
     w->nv = 0;
+    w->nreal = 0;
     w->usize = w->csize = 0;
+}
+
+/* one list of every member (a filter, Find, Check 8.3, or chosen), or
+   one folder at a time */
+static int aw_flat(AWIN *w)
+{
+    return w->flat || w->filt[0];
+}
+
+/* the folder new members go into, and names are taken relative to */
+static const char *aw_here(AWIN *w)
+{
+    return aw_flat(w) ? "" : w->cwd;
+}
+
+/* the last part of a member's name */
+static const char *mbase(const char *name)
+{
+    const char *s = strrchr(name, '/');
+    return s ? s + 1 : name;
+}
+
+/* how much of name is its folder's path */
+static size_t parent_len(const char *name)
+{
+    const char *s = strrchr(name, '/');
+    return s ? (size_t)(s - name) : 0;
+}
+
+static int in_folder(const char *name, const char *dir)
+{
+    size_t n = strlen(dir);
+    return parent_len(name) == n && !strncmp(name, dir, n);
+}
+
+/* name relative to the folder dir (as it is if it isn't in there) */
+static const char *rel_to(const char *name, const char *dir)
+{
+    size_t n = strlen(dir);
+    if (n && !strncmp(name, dir, n) && name[n] == '/' && name[n + 1])
+        return name + n + 1;
+    return name;
+}
+
+static int ci_cmp(const char *a, const char *b)
+{
+    while (*a && toupper((u8)*a) == toupper((u8)*b))
+        a++, b++;
+    return toupper((u8)*a) - toupper((u8)*b);
 }
 
 static int aw_rows(AWIN *w)
@@ -500,8 +572,14 @@ static void aw_set_info(AWIN *w)
     else {
         size_str(w->usize, a);
         size_str(w->csize, b);
-        sprintf(w->info, " %s, %d member%s, %s bytes, %s packed", af_name(w->fmt),
-                w->n, w->n == 1 ? "" : "s", a, b);
+        if (aw_flat(w))
+            w->info[0] = 0;
+        else
+            sprintf(w->info, " /%.40s ", w->cwd);
+        sprintf(w->info + strlen(w->info), " %s, %d member%s, %s bytes, %s packed", af_name(w->fmt),
+                w->nreal, w->nreal == 1 ? "" : "s", a, b);
+        if (w->flat && !w->filt[0])
+            strcat(w->info, ", all folders");
         if (w->filt[0])
             sprintf(w->info + strlen(w->info), ", %d shown (%s)", w->nv, w->filt);
         if (nsel)
@@ -596,13 +674,16 @@ static void aw_draw(AWIN *w, GRECT *clip)
     vis = aw_rows(w);
     if (!w->n || !w->nv) {
         v_gtext(vdih, x, y, w->busy ? "(reading the archive...)" :
-                w->isnew ? "(empty: drop files on this window)" :
-                w->n ? "(nothing matches the filter)" : "(no members)");
+                w->isnew || !w->nreal ? "(empty: drop files on this window)" :
+                "(nothing matches the filter)");
         return;
     }
-    for (i = (int)w->top; i < w->nv && i < w->top + vis + 1; i++) {
-        MEMB *e = &w->e[w->vis[i]];
-        const char *nm = e->name;
+    for (i = (int)w->top; i < w->nv && i < w->top + vis + 1; i++, y += cell_h) {
+        MEMB *e;
+        if (y + cell_h <= clip->g_y || y - 1 >= clip->g_y + clip->g_h)
+            continue;                        /* not in the area being drawn */
+        e = &w->e[w->vis[i]];
+        const char *nm = aw_flat(w) ? e->name : mbase(e->name);
         int l = (int)strlen(nm);
         char shown[260];
         if (l > namew) {                     /* keep the end of long paths */
@@ -610,9 +691,11 @@ static void aw_draw(AWIN *w, GRECT *clip)
             strcat(shown, nm + l - (namew - 3));
         } else
             strcpy(shown, nm);
-        if (e->flags & 1)
+        if (e->flags & MF_UP)
+            sprintf(line, "%-*.*s %6s %6s %-7s", namew, namew, "..", "", "", "up");
+        else if (e->flags & 1)
             sprintf(line, "%-*.*s %6s %6s %-7s %s", namew, namew, shown, "", "", "folder",
-                    date_str(e->dt, dt));
+                    e->dt ? date_str(e->dt, dt) : "");
         else
             sprintf(line, "%-*.*s %s %s %-7.7s %s", namew, namew, shown,
                     size_str(e->usize, s1), size_str(e->csize, s2),
@@ -629,7 +712,6 @@ static void aw_draw(AWIN *w, GRECT *clip)
         } else
             vst_color(vdih, (e->flags & 2) && scr_planes > 1 ? 2 : 1);
         v_gtext(vdih, x, y, line);
-        y += cell_h;
     }
     vst_color(vdih, 1);
 }
@@ -662,6 +744,8 @@ static void aw_redraw(AWIN *w, GRECT *area)
 
 static void aw_changed(AWIN *w)
 {
+    if (w->e)
+        w->e[w->n].sel = 0;                  /* the ".." row isn't selected */
     aw_slider(w);
     aw_set_info(w);
     post_redraw_h(w->handle);
@@ -704,14 +788,29 @@ static int aw_shows(AWIN *w, MEMB *e)
 
 /* the rows shown again (the list or the filter changed); members that
    are hidden aren't selected, so nothing unseen is extracted or deleted */
+static AWIN *sort_w;
+
+/* the folder view's order: .. first, then folders, then files, by name */
+static int row_cmp(const void *a, const void *b)
+{
+    const MEMB *x = &sort_w->e[*(const int *)a], *y = &sort_w->e[*(const int *)b];
+    int d = (y->flags & MF_UP) - (x->flags & MF_UP);
+    if (d)
+        return d;
+    d = (y->flags & MF_DIR) - (x->flags & MF_DIR);
+    if (d)
+        return d;
+    return ci_cmp(mbase(x->name), mbase(y->name));
+}
+
 static void aw_refilter(AWIN *w)
 {
-    int i;
+    int i, flat = aw_flat(w);
     free(w->vis);
     free(w->rowof);
     w->nv = 0;
-    w->vis = (int *)malloc((w->n + 1) * sizeof(int));
-    w->rowof = (int *)malloc((w->n + 1) * sizeof(int));
+    w->vis = (int *)malloc((w->n + 2) * sizeof(int));
+    w->rowof = (int *)malloc((w->n + 2) * sizeof(int));
     if (!w->vis || !w->rowof) {
         free(w->vis);
         free(w->rowof);
@@ -719,18 +818,107 @@ static void aw_refilter(AWIN *w)
         w->filt[0] = 0;                      /* can't: show none */
         return;
     }
+    w->rowof[w->n] = -1;
+    if (!flat && w->cwd[0] && w->e)          /* the way up */
+        w->vis[w->nv++] = w->n;
     for (i = 0; i < w->n; i++)
-        if (aw_shows(w, &w->e[i])) {
+        if (flat ? !(w->e[i].flags & MF_IMPL) && aw_shows(w, &w->e[i]) :
+                   in_folder(w->e[i].name, w->cwd)) {
             w->rowof[i] = w->nv;
             w->vis[w->nv++] = i;
         } else {
             w->rowof[i] = -1;
             w->e[i].sel = 0;
         }
-    if (w->cur >= w->n || (w->cur >= 0 && w->rowof[w->cur] < 0))
+    if (!flat) {
+        sort_w = w;
+        qsort(w->vis, w->nv, sizeof(int), row_cmp);
+    }
+    for (i = 0; i < w->nv; i++)
+        w->rowof[w->vis[i]] = i;
+    if (w->cur > w->n || (w->cur >= 0 && w->rowof[w->cur] < 0))
         w->cur = -1;
-    if (w->anchor >= w->n || (w->anchor >= 0 && w->rowof[w->anchor] < 0))
+    if (w->anchor > w->n || (w->anchor >= 0 && w->rowof[w->anchor] < 0))
         w->anchor = -1;
+}
+
+static int str_cmp(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* LHA, ZOO, LZX and many ZIPs name folders only in their members' paths:
+   a made-up entry for each such folder, so the folder view can show it;
+   then the ".." row after the members (e[n]) */
+static void aw_add_folders(AWIN *w)
+{
+    char **have, **want = 0, buf[256];
+    int nh = w->n, nw = 0, cap = 0, i, k;
+    MEMB *ne;
+    have = (char **)malloc((nh + 1) * sizeof(char *));
+    for (i = 0; have && i < nh; i++)
+        have[i] = w->e[i].name;
+    if (have)
+        qsort(have, nh, sizeof(char *), str_cmp);
+    for (i = 0; have && i < nh; i++) {
+        const char *nm = w->e[i].name, *p;
+        for (p = strchr(nm, '/'); p; p = strchr(p + 1, '/')) {
+            const char *kp = buf;
+            size_t l = (size_t)(p - nm);
+            if (!l || l >= sizeof buf)
+                continue;
+            memcpy(buf, nm, l);
+            buf[l] = 0;
+            if (bsearch(&kp, have, nh, sizeof(char *), str_cmp))
+                continue;
+            if (nw == cap) {
+                char **a = (char **)realloc(want, (cap = cap ? cap * 2 : 32) * sizeof(char *));
+                if (!a)
+                    break;
+                want = a;
+            }
+            if (!(want[nw] = (char *)malloc(l + 1)))
+                break;
+            strcpy(want[nw++], buf);
+        }
+    }
+    free(have);
+    if (nw)
+        qsort(want, nw, sizeof(char *), str_cmp);
+    for (i = k = 0; i < nw; i++) {           /* each one once */
+        if (k && !strcmp(want[k - 1], want[i]))
+            free(want[i]);
+        else
+            want[k++] = want[i];
+    }
+    nw = k;
+    ne = (MEMB *)realloc(w->e, (w->n + nw + 2) * sizeof(MEMB));
+    if (!ne) {
+        for (i = 0; i < nw; i++)
+            free(want[i]);
+        nw = 0;
+    } else
+        w->e = ne;
+    for (i = 0; i < nw; i++) {
+        MEMB *e = &w->e[w->n++];
+        memset(e, 0, sizeof *e);
+        e->name = want[i];
+        e->flags = MF_DIR | MF_IMPL;
+    }
+    free(want);
+    memset(&w->e[w->n], 0, sizeof(MEMB));
+    w->e[w->n].name = "..";
+    w->e[w->n].flags = MF_DIR | MF_UP;
+}
+
+/* the folder of that name (a member or made-up), -1 if none */
+static int aw_find_folder(AWIN *w, const char *dir)
+{
+    int i;
+    for (i = 0; i < w->n; i++)
+        if ((w->e[i].flags & MF_DIR) && !strcmp(w->e[i].name, dir))
+            return i;
+    return -1;
 }
 
 static void aw_take_list(AWIN *w, const u8 *b, long len)
@@ -755,7 +943,7 @@ static void aw_take_list(AWIN *w, const u8 *b, long len)
         e->usize = (long)get4(p);
         e->csize = (long)get4(p + 4);
         e->dt = get4(p + 8);
-        e->flags = p[12];
+        e->flags = p[12] & (MF_DIR | MF_UNS);      /* (4: an LZX group, not wanted here) */
         memcpy(e->m, p + 13, 8);
         e->m[8] = 0;
         e->name = malloc(nl + 1);
@@ -766,7 +954,12 @@ static void aw_take_list(AWIN *w, const u8 *b, long len)
         p += 22 + nl;
         w->n++;
     }
+    w->nreal = w->n;
+    aw_add_folders(w);
     w->isnew = 0;
+    /* still in the folder it was in, or the nearest one there still is */
+    while (w->cwd[0] && aw_find_folder(w, w->cwd) < 0)
+        w->cwd[parent_len(w->cwd)] = 0;
     aw_refilter(w);
 }
 
@@ -846,6 +1039,28 @@ static int aw_count_sel(AWIN *w)
     return n;
 }
 
+/* what the selection takes in: the members selected, and in the folder
+   view everything in a selected folder (malloc'd, one flag a member) */
+static u8 *aw_eff_sel(AWIN *w)
+{
+    u8 *f = (u8 *)calloc(w->n + 1, 1);
+    int i, k;
+    if (!f)
+        return 0;
+    for (i = 0; i < w->n; i++)
+        f[i] = w->e[i].sel;
+    for (k = 0; k < w->n; k++) {
+        const char *d = w->e[k].name;
+        size_t l = strlen(d);
+        if (!w->e[k].sel || !(w->e[k].flags & MF_DIR))
+            continue;
+        for (i = 0; i < w->n; i++)
+            if (!f[i] && !strncmp(w->e[i].name, d, l) && w->e[i].name[l] == '/')
+                f[i] = 1;
+    }
+    return f;
+}
+
 /* for the menu: an archive that has been read, and for Extract selected
    something selected in it */
 
@@ -878,6 +1093,8 @@ typedef struct {
     int   movefmt;                           /* ... in its format         */
     char  rnold[256], rnnew[256];            /* rename: member or folder  */
     char  dell[256];                         /* rename: names to take out */
+    char  strip[128];                        /* extract: folder left off  */
+    char  into[128];                         /* add: into this folder     */
 } TASK;
 
 static TASK *tasks;
@@ -929,6 +1146,7 @@ static FILE *list_file(char *path, const char *mode)
 }
 
 static void begin(void);
+static void done_close(void);
 
 /* the folder an archive is extracted into */
 static void extract_dest(const char *arc, char *out)
@@ -968,19 +1186,26 @@ static void queue_extract(const char *arc, AWIN *w, int selected)
         t->handle = w->handle, t->serial = w->serial;
     if (w && selected && aw_count_sel(w)) {
         FILE *f = list_file(t->list, "w");
+        u8 *eff = aw_eff_sel(w);
         int i;
-        if (!f) {
+        if (!f || !eff) {
+            if (f)
+                fclose(f);
+            free(eff);
             tn--;
             log_add("Cannot write a list file next to FArchive");
             return;
         }
+        t->nitems = 0;
         for (i = 0; i < w->n; i++)
-            if (w->e[i].sel) {
+            if (eff[i] && !(w->e[i].flags & MF_IMPL)) {
                 fputs(w->e[i].name, f);
                 fputs("\n", f);
+                t->nitems++;
             }
         fclose(f);
-        t->nitems = aw_count_sel(w);
+        free(eff);
+        sprintf(t->strip, "%.127s", aw_here(w));
     }
 }
 
@@ -1074,10 +1299,27 @@ static void build_dialog(void)
     y += bh + cell_h + 4;
     ptree[P_STAT].ob_spec.free_string = t_stat;
     SET(P_STAT, pad, y + (btnh - cell_h) / 2, pw - btnw - 2 * cell_w, cell_h);
-    ptree[P_BTN].ob_flags = SELECTABLE | EXIT | DEFAULT | LASTOB | (aes_3d ? FL3DACT : 0);
+    ptree[P_BTN].ob_flags = SELECTABLE | EXIT | DEFAULT | (aes_3d ? FL3DACT : 0);
     ptree[P_BTN].ob_spec.free_string = t_btn;
     SET(P_BTN, pad + pw - btnw, y, btnw, btnh);
+    /* Log, beside OK when something failed: opens the main window */
+    ptree[P_LOG].ob_flags = SELECTABLE | EXIT | LASTOB | HIDETREE | (aes_3d ? FL3DACT : 0);
+    ptree[P_LOG].ob_state = 0;
+    SET(P_LOG, pad + pw - 2 * btnw - cell_w, y, btnw, btnh);
     ptree[P_ROOT].ob_height = y + btnh + pad;
+}
+
+/* the Log button shown or not; the status beside the buttons as wide as
+   there is room for */
+static void log_button(int show)
+{
+    int pw = ptree[P_FBOX].ob_width, btnw = ptree[P_BTN].ob_width;
+    if (show)
+        ptree[P_LOG].ob_flags &= ~HIDETREE;
+    else
+        ptree[P_LOG].ob_flags |= HIDETREE;
+    ptree[P_LOG].ob_state = 0;
+    ptree[P_STAT].ob_width = pw - (show ? 2 * btnw + 3 * cell_w : btnw + 2 * cell_w);
 }
 
 static void dlg_place(void)
@@ -1189,8 +1431,13 @@ static void set_total_text(void)
 static void set_stat_text(int pct)
 {
     if (finished) {
-        if (n_fail || n_tfail)
-            sprintf(t_stat, "%d failed: %.24s", n_fail + n_tfail, first_err);
+        if (n_fail || n_tfail) {
+            /* the count beside Log and OK, the archive and its error on the
+               line between the bars (the dialog's whole width) */
+            sprintf(t_stat, "%d failed", n_fail + n_tfail);
+            if (first_err[0])
+                sprintf(t_file, "%.40s", first_err);
+        }
         else if (n_ren)
             sprintf(t_stat, "%d renamed for 8.3", n_ren);
         else if (n_skip)
@@ -1228,8 +1475,16 @@ static void finish_all(void)
             cancelling ? "Cancelled" : "Finished", n_ok, n_fail + n_tfail, n_skip, n_ren,
             secs(now_ms() - batch_t0, t));
     cur = 0;
+    /* all went well (or it was cancelled): the progress dialog just goes;
+       it stays, with OK, only to say what failed or was skipped */
+    if (!(n_fail || n_tfail || n_skip)) {
+        fa_menu_update();
+        done_close();
+        return;
+    }
     strcpy(t_btn, "OK");
     ptree[P_BTN].ob_state &= ~SELECTED;
+    log_button(1);
     fa_menu_update();
     strcpy(t_file, "");
     set_total_text();
@@ -1257,6 +1512,8 @@ static void start_next(void)
         strncpy(j->q.out, t->out, sizeof j->q.out - 1);
         strncpy(j->q.list, t->list, sizeof j->q.list - 1);
         strncpy(j->q.map, t->map, sizeof j->q.map - 1);
+        strncpy(j->q.strip, t->strip, sizeof j->q.strip - 1);
+        strncpy(j->q.into, t->into, sizeof j->q.into - 1);
         j->q.afmt = t->afmt;
         j->q.aflags = ((cs.replace ? AJ_REPLACE : 0) | (cs.rename83 ? AJ_RENAME83 : 0) |
                        (cs.subdirs ? AJ_SUBDIRS : 0) | (cs.paths ? AJ_PATHS : 0) |
@@ -1274,6 +1531,8 @@ static void start_next(void)
             log_add("Adding %d item%s to %s", t->nitems, t->nitems == 1 ? "" : "s", t->path);
         else if (t->op == OP_ARC_DELETE)
             log_add("Deleting %d member%s from %s", t->nitems, t->nitems == 1 ? "" : "s", t->path);
+        else if (t->op == OP_ARC_RENAME)
+            log_add("Renaming %d name%s in %s", t->nitems, t->nitems == 1 ? "" : "s", t->path);
         strcpy(t_file, "");
         set_total_text();
         set_stat_text((int)(tpos * 100L / (tn ? tn : 1)));
@@ -1468,7 +1727,7 @@ static int map_rename(const char *map, const char *old, const char *nw)
 
 static void copy_step(TASK *t, int ok)
 {
-    char tmp[256], movel[256], movep[256], rnold[256], rnnew[256], dell[256];
+    char tmp[256], movel[256], movep[256], rnold[256], rnnew[256], dell[256], into[128];
     int h = t->copy_h, addclr = t->addclr, movefmt = t->movefmt;
     long ser = t->copy_serial;
     strcpy(movel, t->movel);
@@ -1476,6 +1735,7 @@ static void copy_step(TASK *t, int ok)
     strcpy(rnold, t->rnold);
     strcpy(rnnew, t->rnnew);
     strcpy(dell, t->dell);
+    strcpy(into, t->into);
     t->movel[0] = t->rnold[0] = t->dell[0] = 0;
     if (t->cleanup[0]) {                     /* the add is done: the temp goes */
         afs_rmtree(t->cleanup);
@@ -1541,6 +1801,7 @@ static void copy_step(TASK *t, int ok)
             TASK *a = &tasks[tn - 1];
             a->setf = AJ_PATHS | AJ_SUBDIRS;
             a->clrf = addclr;
+            strcpy(a->into, into);
             strcpy(a->cleanup, tmp);
             strcpy(a->map, map);             /* the original names back */
             strcpy(a->movel, movel);
@@ -1569,7 +1830,8 @@ static void copy_step(TASK *t, int ok)
 /* names[] (members of the archive fpath) copied into the archive window
    to; clr: AJ_ flags its add leaves off; move: deleted from fpath after */
 static void copy_members(const char *fpath, int ffmt, int fh, long fs,
-                         char **names, int nn, AWIN *to, int clr, int move)
+                         char **names, int nn, AWIN *to, int clr, int move,
+                         const char *strip, const char *into)
 {
     char tmp[256], dir[256], fp[256];
     TASK *t;
@@ -1601,6 +1863,8 @@ static void copy_members(const char *fpath, int ffmt, int fh, long fs,
     t->copy_h = to->handle;
     t->copy_serial = to->serial;
     t->addclr = clr;
+    sprintf(t->strip, "%.127s", strip);      /* extracted relative to it */
+    sprintf(t->into, "%.127s", into);        /* for the add after         */
     /* FAT shortens long names in the temporary folder: the extracting
        notes each file's original name here, the adding puts it back */
     sprintf(t->map, "%s.MAP", dir);
@@ -1690,7 +1954,7 @@ void win_job_finished(VWIN *vw, JOB *j)
                   !(j->q.op == OP_ARC_ADD && t->movel[0] && j->res.acount[2]));
     /* the archive (may have) changed: read it again - now, or when the
        cancelled batch's dialog is closed                              */
-    if (j->q.op == OP_ARC_ADD || j->q.op == OP_ARC_DELETE) {
+    if (j->q.op == OP_ARC_ADD || j->q.op == OP_ARC_DELETE || j->q.op == OP_ARC_RENAME) {
         AWIN *aw2 = find_aw_path(j->q.path);
         if (aw2) {
             /* read again even after an error: the archive may have
@@ -1831,8 +2095,6 @@ static void begin(void)
     for (i = tpos; i < tn; i++)
         if (tasks[i].op != OP_ARC_LIST)
             quiet = 0;
-    if (!quiet)
-        show_log();                          /* open the icon: the log */
     if (running)
         return;                              /* added to the running batch */
     /* a new batch: forget the tasks of the last one */
@@ -1842,6 +2104,7 @@ static void begin(void)
         tpos = 0;
     }
     batch_t0 = now_ms();
+    log_button(0);                           /* (a dialog left open from the last) */
     if (!quiet) {
         time_t now = time(0);
         struct tm *tm = localtime(&now);
@@ -1868,22 +2131,29 @@ static void begin(void)
     want_next = 1;
 }
 
+/* the batch is over: the dialog goes, archives a cancelled batch left
+   unread are read again */
+static void done_close(void)
+{
+    int i;
+    dlg_close();
+    finished = 0;
+    tn = tpos = 0;
+    for (i = 0; i < MAXAW; i++)
+        if (aw[i].handle > 0 && aw[i].stale) {
+            aw[i].stale = 0;
+            if (exists(aw[i].path)) {
+                aw[i].isnew = 0;
+                queue_list(&aw[i]);
+            }
+        }
+}
+
 static void dlg_button(void)
 {
-    if (finished) {
-        int i;
-        dlg_close();
-        finished = 0;
-        tn = tpos = 0;
-        for (i = 0; i < MAXAW; i++)
-            if (aw[i].handle > 0 && aw[i].stale) {
-                aw[i].stale = 0;
-                if (exists(aw[i].path)) {
-                    aw[i].isnew = 0;
-                    queue_list(&aw[i]);
-                }
-            }
-    } else
+    if (finished)
+        done_close();
+    else
         cancel_all();
 }
 
@@ -2019,9 +2289,10 @@ static void each_arg(char *s, void (*fn)(const char *))
 
 /* names dropped: on an archive window they are added to it, on the
    icon (or the log) archives are extracted / opened and the rest packed */
-static void dropped(char *args, int handle)
+static void dropped(char *args, int handle, int mx, int my)
 {
     AWIN *w = find_aw(handle);
+    drop_row = w && mx >= 0 ? aw_row_at(w, mx, my) : -1;
     graf_mouse(BUSYBEE, 0);
     if (w)
         each_arg(args, loose_add);
@@ -2470,6 +2741,12 @@ static void do_new(void)
     new_archive_begin(NA_NEW);
 }
 
+static void new_log(void *ctx, const char *line)
+{
+    (void)ctx;
+    log_add("%s", line);
+}
+
 /* the format is chosen: the name, then the archive or the packing */
 static void new_archive_go(int kind)
 {
@@ -2491,7 +2768,25 @@ static void new_archive_go(int kind)
         return;
     }
     fmt = af_from_name(arc);
-    aw_open(arc, fmt != AF_NONE ? fmt : cs.fmt, 1);
+    if (fmt == AF_NONE)
+        fmt = cs.fmt;
+    /* made on disk now, empty, so it's there to see (and a folder it is in
+       added to it leaves it out); a GZ holds one file, so it waits for it */
+    if (fmt != AF_GZ) {
+        AOPT o;
+        int e;
+        memset(&o, 0, sizeof o);
+        o.log = new_log;
+        o.level = cs.best ? 3 : 2;
+        e = arch_add(arc, fmt, 0, 0, &o);
+        if (e == E_OK) {
+            log_add("Made %s (%s, empty)", arc, af_name(fmt));
+            aw_open(arc, fmt, 0);
+            return;
+        }
+        log_add("Could not make %s: %s", arc, fv_errstr(e));
+    }
+    aw_open(arc, fmt, 1);
 }
 
 static void do_add_files(void)
@@ -2586,16 +2881,26 @@ static void aw_show_row(AWIN *w, int i)
 {
     int vis = aw_rows(w), r;
     w->anchor = i;
-    if (i < 0 || i >= w->n || !w->rowof || (r = w->rowof[i]) < 0)
+    if (i < 0 || i > w->n || !w->rowof || (r = w->rowof[i]) < 0)
         return;
     if (r < w->top || r >= w->top + vis)
         w->top = r - vis / 3;
 }
 
 /* select every match, show the first */
+static void aw_all_folders(AWIN *w)
+{
+    if (!w->flat) {
+        w->flat = 1;
+        aw_refilter(w);
+        w->top = 0;
+    }
+}
+
 static void find_all(AWIN *w)
 {
     int i, n = 0, first = -1;
+    aw_all_folders(w);
     for (i = 0; i < w->n; i++) {
         w->e[i].sel = (u8)(w->rowof && w->rowof[i] >= 0 &&
                            find_match(w->e[i].name, find_pat));
@@ -2723,15 +3028,16 @@ static void check83(AWIN *w)
         return;
     list = (char **)malloc((w->n + 1) * sizeof(char *));
     log_add("8.3 check of %s:", base_name(w->path));
-    if (w && w->filt[0]) {                   /* the whole archive: no filter */
-        w->filt[0] = 0;
-        aw_refilter(w);
-    }
+    w->filt[0] = 0;                          /* the whole archive: no filter, */
+    w->flat = 0;
+    aw_all_folders(w);                       /* every folder in one list */
     for (i = 0; i < w->n; i++) {
         char part[256];
         const char *p = w->e[i].name, *e;
         int ok = 1;
         w->e[i].sel = 0;
+        if (w->e[i].flags & MF_IMPL)
+            continue;
         if (af_mac_meta(w->e[i].name)) {
             mac++;
             if (cs.nomac)
@@ -2766,7 +3072,7 @@ static void check83(AWIN *w)
         log_add("  ... and %d more", shown - 30);
     aw_changed(w);
     if (!bad) {
-        log_add("  all %d member%s have 8.3 names: TOS safe%s", w->n, w->n == 1 ? "" : "s",
+        log_add("  all %d member%s have 8.3 names: TOS safe%s", w->nreal, w->nreal == 1 ? "" : "s",
                 mac && cs.nomac ? " (Mac files left out)" : "");
         alertf("[1][FArchive: every name in|%.30s|is a valid 8.3 name:|safe to extract on TOS.][ OK ]",
                base_name(w->path));
@@ -2775,7 +3081,7 @@ static void check83(AWIN *w)
     } else if (list && (list[0] = (char *)malloc(80)) != 0) {
         /* the list in a window of its own: heading, then the names */
         char title[80];
-        sprintf(list[0], "%d of %d member%s: not 8.3 names", bad, w->n, w->n == 1 ? "" : "s");
+        sprintf(list[0], "%d of %d member%s: not 8.3 names", bad, w->nreal, w->nreal == 1 ? "" : "s");
         sprintf(title, "Not 8.3: %.40s", base_name(w->path));
         log_add("  %d member%s with names that aren't 8.3", bad, bad == 1 ? "" : "s");
         lw_open(title, list, nl + 1);
@@ -2797,6 +3103,7 @@ static void find_next(AWIN *w)
     int i, k;
     if (!aw_can_extract(w, 0) || !find_pat[0])
         return;
+    aw_all_folders(w);
     for (k = 1; k <= w->n; k++) {
         i = (w->anchor + k) % w->n;
         if (w->rowof && w->rowof[i] >= 0 && find_match(w->e[i].name, find_pat)) {
@@ -2810,14 +3117,73 @@ static void find_next(AWIN *w)
     alertf("[1][FArchive: nothing in this|archive matches|\"%.30s\".][ OK ]", find_pat);
 }
 
+/* Archive > List contents: every member, its size, packed size, method
+   and date, in the log (and, when there are more than the log keeps,
+   in a list window too) */
+static void list_contents(AWIN *w)
+{
+    char **list, s1[12], s2[12], dt[20], title[80];
+    int i, nl = 0;
+    if (!aw_can_extract(w, 0))
+        return;
+    list = (char **)malloc((w->nreal + 3) * sizeof(char *));
+    log_add("Contents of %s: %s, %d member%s", base_name(w->path), af_name(w->fmt),
+            w->nreal, w->nreal == 1 ? "" : "s");
+    log_add("    Size  Packed Method  Date            Name");
+    for (i = 0; i < w->n; i++) {
+        MEMB *e = &w->e[i];
+        char line[340];
+        if (e->flags & MF_IMPL)
+            continue;
+        if (e->flags & MF_DIR)
+            sprintf(line, "%8s %7s %-7s %-15s %.250s/", "", "", "folder", e->dt ? date_str(e->dt, dt) : "", e->name);
+        else
+            sprintf(line, "%8s %7s %-7.7s %-15s %.250s", size_str(e->usize, s1), size_str(e->csize, s2),
+                    (e->flags & MF_UNS) ? "?" : e->m, date_str(e->dt, dt), e->name);
+        log_add("%s", line);
+        if (list && (list[++nl] = (char *)malloc(strlen(line) + 1)) != 0)
+            strcpy(list[nl], line);
+        else if (list)
+            nl--;
+    }
+    size_str(w->usize, s1);
+    size_str(w->csize, s2);
+    log_add("  %s bytes, %s packed", s1, s2);
+    show_log();
+    if (list && nl > LOGN - 10 && (list[0] = (char *)malloc(80)) != 0) {
+        sprintf(list[0], "    Size  Packed Method  Date            Name");
+        sprintf(title, "Contents: %.40s", base_name(w->path));
+        lw_open(title, list, nl + 1);
+    } else if (list) {
+        for (i = 1; i <= nl; i++)
+            free(list[i]);
+        free(list);
+    }
+}
+
+/* Archive > All folders in one list: on, or back to the folder view */
+static void toggle_flat(AWIN *w)
+{
+    if (!w || w->isnew)
+        return;
+    if (aw_flat(w))
+        aw_go(w, w->cwd);
+    else {
+        aw_all_folders(w);
+        aw_changed(w);
+    }
+}
+
 static void select_all(AWIN *w, int on)
 {
     int i;
+    u8 *before;
     if (!w)
         return;
+    before = aw_sel_snapshot(w);
     for (i = 0; i < w->n; i++)
         w->e[i].sel = (u8)(on && w->rowof && w->rowof[i] >= 0);
-    aw_changed(w);
+    aw_sel_done(w, before, w->top);
 }
 
 static void changed(void)
@@ -2847,6 +3213,8 @@ static void do_menu(int title, int item)
     case MI_PASTE:   edit_paste(); break;
     case MI_DELETE:  do_delete(); break;
     case MI_FILTER:  do_filter(top_awin()); break;
+    case MI_FLAT:    toggle_flat(top_awin()); break;
+    case MI_LIST:    list_contents(top_awin()); break;
     case MI_FIX83:   fix83(top_awin()); break;
     case MI_RENAME:  do_rename(); break;
     case MI_SELALL:  select_all(top_awin(), 1); break;
@@ -2922,7 +3290,7 @@ static void drag_drop(short *msg)
             Fclose((short)fd);             /* let the desktop go first */
             if (size > 0) {
                 buf[size] = 0;
-                dropped(buf, msg[3]);
+                dropped(buf, msg[3], msg[4], msg[5]);
             }
             free(buf);
             return;
@@ -2950,7 +3318,7 @@ static void va_start_msg(short *msg)
     reply[4] = msg[4];
     appl_write(msg[1], 16, reply);
     if (copy[0])
-        dropped(copy, 0);
+        dropped(copy, 0, -1, -1);
 }
 
 /* AV desktops (Thing, Jinnee, TeraDesk...) report files dragged onto one
@@ -2965,7 +3333,7 @@ static void drag_acc_wind(short *msg)
     strncpy(copy, args, sizeof copy - 1);
     copy[sizeof copy - 1] = 0;
     dbg("VA_DRAGACCWIND window %d: '%s'", msg[3], copy);
-    dropped(copy, msg[3]);
+    dropped(copy, msg[3], msg[4], msg[5]);
 }
 
 static void av_hello(void)
@@ -3376,18 +3744,27 @@ static char **names_sel(AWIN *w, int *n)
 {
     char **d;
     int i, k = 0;
-    *n = aw_count_sel(w);
-    d = (char **)calloc(*n ? *n : 1, sizeof(char *));
-    if (!d)
+    u8 *eff = aw_eff_sel(w);
+    if (!eff)
         return 0;
+    for (i = 0, *n = 0; i < w->n; i++)
+        if (eff[i] && !(w->e[i].flags & MF_IMPL))
+            ++*n;
+    d = (char **)calloc(*n ? *n : 1, sizeof(char *));
+    if (!d) {
+        free(eff);
+        return 0;
+    }
     for (i = 0; i < w->n && k < *n; i++)
-        if (w->e[i].sel) {
+        if (eff[i] && !(w->e[i].flags & MF_IMPL)) {
             if (!(d[k] = (char *)malloc(strlen(w->e[i].name) + 1))) {
                 names_free(d, k);
+                free(eff);
                 return 0;
             }
             strcpy(d[k++], w->e[i].name);
         }
+    free(eff);
     return d;
 }
 
@@ -3407,6 +3784,8 @@ typedef struct {
     int    n;
     int    move;                             /* Cut and Paste              */
     int    repl;                             /* the alert has Keep old     */
+    char   strip[256];                       /* members: relative to this  */
+    char   into[256];                        /* into this folder of to     */
 } ADDASK;
 
 static struct {                              /* Edit > Cut / Copy          */
@@ -3416,6 +3795,7 @@ static struct {                              /* Edit > Cut / Copy          */
     char **names;
     int    n;
     int    cut;
+    char   strip[256];                       /* the folder they were in    */
 } clip;
 
 /* how: 0 a window not busy, 1 and something selected in a read
@@ -3446,13 +3826,19 @@ static void clip_clear(void)
 static int add_replaced(AWIN *to, ADDASK *a)
 {
     int i, k, r = 0;
+    size_t il = strlen(a->into);
     for (k = 0; k < to->n; k++) {
         const char *m = to->e[k].name;
         if (to->e[k].flags & 1)
             continue;
+        if (il) {                            /* only what is in that folder */
+            if (strncmp(m, a->into, il) || m[il] != '/')
+                continue;
+            m += il + 1;
+        }
         for (i = 0; i < a->n; i++) {
             if (!a->files) {
-                if (lc_same(m, a->names[i]))
+                if (lc_same(m, rel_to(a->names[i], a->strip)))
                     break;
             } else {
                 char b[260];
@@ -3489,11 +3875,14 @@ static void add_run(ADDASK *a, int clr)
     if (to) {
         if (a->files) {
             queue_add(to->path, to->fmt, a->names, a->n, to);
-            if (tn > 0 && tasks[tn - 1].op == OP_ARC_ADD)
+            if (tn > 0 && tasks[tn - 1].op == OP_ARC_ADD) {
                 tasks[tn - 1].clrf = clr;
+                sprintf(tasks[tn - 1].into, "%.127s", a->into);
+            }
             begin();
         } else {
-            copy_members(a->fpath, a->ffmt, a->fh, a->fs, a->names, a->n, to, clr, a->move);
+            copy_members(a->fpath, a->ffmt, a->fh, a->fs, a->names, a->n, to, clr, a->move,
+                         a->strip, a->into);
             if (a->move && same_path(clip.path, a->fpath))
                 clip_clear();                /* they are moving: gone after */
         }
@@ -3549,16 +3938,32 @@ static ADDASK *add_new(AWIN *to)
     if (a) {
         a->th = to->handle;
         a->ts = to->serial;
+        strcpy(a->into, aw_here(to));        /* the folder it shows */
     }
     return a;
 }
 
-/* members of one archive window dropped on another */
-static void copy_ask(AWIN *from, AWIN *to)
+/* the folder a row stands for: a folder's, or .. the one above; else
+   the folder the window shows */
+static void row_folder(AWIN *w, int row, char *out)
+{
+    strcpy(out, aw_here(w));
+    if (row < 0 || row > w->n || !w->e || !(w->e[row].flags & MF_DIR))
+        return;
+    if (w->e[row].flags & MF_UP)
+        out[parent_len(out)] = 0;
+    else
+        strcpy(out, w->e[row].name);
+}
+
+/* members of one archive window dropped on another (row: on that row) */
+static void copy_ask(AWIN *from, AWIN *to, int row)
 {
     ADDASK *a;
     if (from == to || from->isnew || !(a = add_new(to)))
         return;
+    row_folder(to, row, a->into);
+    strcpy(a->strip, aw_here(from));
     strcpy(a->fpath, from->path);
     a->ffmt = from->fmt;
     a->fh = from->handle;
@@ -3580,6 +3985,9 @@ static void add_files_ask(struct AWIN *to, char **names, int n)
     }
     a->files = 1;
     a->n = n;
+    if (drop_row >= 0)                       /* dropped on a folder's row */
+        row_folder(to, drop_row, a->into);
+    drop_row = -1;
     add_request(a);
 }
 
@@ -3592,6 +4000,7 @@ static void edit_copy(int cut)
     if (!(clip.names = names_sel(w, &clip.n)))
         return;
     strcpy(clip.path, w->path);
+    strcpy(clip.strip, aw_here(w));
     clip.fmt = w->fmt;
     clip.h = w->handle;
     clip.s = w->serial;
@@ -3606,7 +4015,10 @@ static void edit_paste(void)
     if (!w || w->busy || !clip.n)
         return;
     if (same_path(clip.path, w->path)) {
-        alertf("[1][Those members are in|this archive already.][ OK ]");
+        if (clip.cut && strcmp(clip.strip, aw_here(w)))
+            move_names(w, clip.names, clip.n, clip.strip, aw_here(w));
+        else
+            alertf("[1][Those members are in|this archive already.][ OK ]");
         return;
     }
     if (!exists(clip.path)) {
@@ -3623,6 +4035,7 @@ static void edit_paste(void)
     a->fs = clip.s;
     a->move = clip.cut;
     a->n = clip.n;
+    strcpy(a->strip, clip.strip);
     if (!(a->names = names_dup(clip.names, clip.n))) {
         free(a);
         return;
@@ -3689,78 +4102,39 @@ static void delete_answer(int button, void *ctx)
     }
 }
 
-/* Edit > Rename: one member, or a folder and everything in it, gets a
-   new name in the same folder - to make an archive safe for TOS before
-   extracting it, say. The archive formats keep names inside their own
-   headers (with checksums), so the members are extracted to a temporary
-   folder and added again under the new name, the old ones taken out in
-   the same rewrite: the copy machinery, with the map file it writes
-   pointing the files at their new names.                              */
-static void rename_members(AWIN *w, const char *old, const char *nw)
+/* names changed in the archive itself: list holds "old<TAB>new" lines
+   (taken over); the headers are written again with the new names and
+   the packed data copied as it is - nothing is extracted            */
+static void queue_rename(AWIN *w, const char *list, int n)
 {
-    char tmp[256], dir[256], dell[256];
-    TASK *t;
-    int k, i, nn = 0;
-    size_t ol = strlen(old);
-    FILE *f, *fd;
-    for (k = 0; k < 1000; k++) {
-        sprintf(dir, "%sFARN%04d", app_folder, (int)((now_ms() / 7 + k) % 10000));
-        if (!exists(dir))
-            break;
-    }
-    if (afs_mkdir(dir) != E_OK) {
-        log_add("Cannot make a temporary folder %s", dir);
-        return;
-    }
-    sprintf(tmp, "%s\\", dir);
-    t = task_new(OP_ARC_EXTRACT, w->path);
+    TASK *t = task_new(OP_ARC_RENAME, w->path);
     if (!t) {
-        afs_rmtree(dir);
+        Fdelete(list);
         return;
     }
-    strcpy(t->out, tmp);
+    strcpy(t->list, list);
     t->afmt = w->fmt;
     t->handle = w->handle;
     t->serial = w->serial;
-    t->setf = AJ_PATHS | AJ_REPLACE | AJ_SUBDIRS;
-    t->clrf = AJ_NOMAC;                      /* all of them: all go out after */
-    t->copy_h = w->handle;                   /* back into the same archive */
-    t->copy_serial = w->serial;
-    sprintf(t->map, "%s.MAP", dir);
-    strcpy(t->rnold, old);
-    strcpy(t->rnnew, nw);
-    f = list_file(t->list, "w");
-    fd = f ? list_file(dell, "w") : 0;
-    if (!fd) {
-        if (f) {
-            fclose(f);
-            Fdelete(t->list);
-        }
-        tn--;
-        afs_rmtree(dir);
-        log_add("Cannot write a list file next to FArchive");
-        return;
-    }
-    for (i = 0; i < w->n; i++) {
-        const char *m = w->e[i].name;
-        if (!strncmp(m, old, ol) && (!m[ol] || m[ol] == '/')) {
-            if (!(w->e[i].flags & 1)) {      /* the files are extracted */
-                fputs(m, f);
-                fputs("\n", f);
-            }
-            fputs(m, fd);                    /* all of them taken out */
-            fputs("\n", fd);
-            nn++;
-        }
-    }
-    fclose(f);
-    fclose(fd);
-    strcpy(t->dell, dell);
-    t->nitems = nn;
-    log_add("Renaming %s to %s in %s", old, nw, base_name(w->path));
+    t->nitems = n;
     w->busy = 1;                             /* until it is read again */
     aw_changed(w);
     begin();
+}
+
+/* Edit > Rename: one member, or a folder and everything in it */
+static void rename_members(AWIN *w, const char *old, const char *nw)
+{
+    char list[256];
+    FILE *f = list_file(list, "w");
+    if (!f) {
+        log_add("Cannot write a list file next to FArchive");
+        return;
+    }
+    fprintf(f, "%s\t%s\n", old, nw);
+    fclose(f);
+    log_add("Renaming %s to %s in %s", old, nw, base_name(w->path));
+    queue_rename(w, list, 1);
 }
 
 /* Archive > Fix 8.3 names: every file and folder name that isn't a
@@ -3905,50 +4279,16 @@ typedef struct { int h; long s; int n; char tab[256], list[256], dell[256]; } FI
 static void fix83_run(FIXASK *f)
 {
     AWIN *w = find_aw_task(f->h, f->s);
-    char tmp[256], dir[256];
-    TASK *t;
-    int k;
+    Fdelete(f->list);                        /* (the table is all it needs) */
+    Fdelete(f->dell);
     if (!w || w->busy) {
         Fdelete(f->tab);
-        Fdelete(f->list);
-        Fdelete(f->dell);
         free(f);
         return;
     }
-    for (k = 0; k < 1000; k++) {
-        sprintf(dir, "%sFARN%04d", app_folder, (int)((now_ms() / 7 + k) % 10000));
-        if (!exists(dir))
-            break;
-    }
-    if (afs_mkdir(dir) != E_OK || !(t = task_new(OP_ARC_EXTRACT, w->path))) {
-        log_add("Cannot make a temporary folder %s", dir);
-        Fdelete(f->tab);
-        Fdelete(f->list);
-        Fdelete(f->dell);
-        free(f);
-        return;
-    }
-    sprintf(tmp, "%s\\", dir);
-    strcpy(t->out, tmp);
-    t->afmt = w->fmt;
-    t->handle = w->handle;
-    t->serial = w->serial;
-    t->setf = AJ_PATHS | AJ_REPLACE | AJ_SUBDIRS;
-    t->clrf = AJ_NOMAC;
-    t->copy_h = w->handle;
-    t->copy_serial = w->serial;
-    sprintf(t->map, "%s.MAP", dir);
-    t->rnold[0] = 1;                         /* a table, not one rename */
-    t->rnold[1] = 0;
-    strcpy(t->rnnew, f->tab);
-    strcpy(t->list, f->list);
-    strcpy(t->dell, f->dell);
-    t->nitems = f->n;
     log_add("Fixing %d name%s in %s", f->n, f->n == 1 ? "" : "s", base_name(w->path));
-    w->busy = 1;
-    aw_changed(w);
+    queue_rename(w, f->tab, f->n);
     free(f);
-    begin();
 }
 
 static void fix83_answer(int button, void *ctx)
@@ -4035,16 +4375,6 @@ static void fix83(struct AWIN *w)
             if (!(w->e[i].flags & 1)) {
                 fprintf(fl, "%s\n", m);
                 nfiles++;
-            } else {                         /* a folder: only with files in it */
-                size_t ml = strlen(m);
-                for (j = 0; j < w->n; j++)
-                    if (!(w->e[j].flags & 1) && !strncmp(w->e[j].name, m, ml) &&
-                        w->e[j].name[ml] == '/')
-                        break;
-                if (j == w->n) {
-                    log_add("  %s: an empty folder, left as it is", m);
-                    continue;
-                }
             }
             fprintf(ft, "%s\t%s\n", m, nw);
             fprintf(fd, "%s\n", m);
@@ -4057,7 +4387,8 @@ static void fix83(struct AWIN *w)
     fclose(ft);
     fclose(fl);
     fclose(fd);
-    if (err || !nfiles) {
+    (void)j;
+    if (err || !nfix) {
         Fdelete(f->tab);
         Fdelete(f->list);
         Fdelete(f->dell);
@@ -4076,7 +4407,6 @@ static void fix83(struct AWIN *w)
     /* always asked: it changes many names at once */
     sprintf(al, "[2][Give %d name%s in|%.30s|8.3 names? (listed in the log)][ Fix |Cancel]",
             nfix, nfix == 1 ? "" : "s", base_name(w->path));
-    show_log();
     alert_show(2, al, fix83_answer, f, 0);
 }
 
@@ -4185,7 +4515,7 @@ static void do_rename(void)
     AWIN *w = top_awin();
     RENFOR *rf;
     int i;
-    if (!aw_editable(w, 2) || aw_count_sel(w) != 1)
+    if (!aw_editable(w, 1) || aw_count_sel(w) != 1)
         return;
     for (i = 0; i < w->n && !w->e[i].sel; i++)
         ;
@@ -4211,7 +4541,7 @@ static void do_rename(void)
         free(rf);
         return;
     }
-    if (strlen(rf->old) < RN_MAX) {          /* the path: any part can change */
+    if (strlen(rf->old) < RN_MAX && aw_flat(w)) {   /* the path: any part can change */
         rf->full = 1;
         wd_set_field(rn_dlg, RN_FIELD, rf->old);
     } else {
@@ -4248,6 +4578,120 @@ static void do_delete(void)
     sprintf(al, "[3][Delete %d member%s from|%.30s?|This can't be undone.][Delete|Cancel]",
             d->n, d->n == 1 ? "" : "s", base_name(w->path));
     alert_show(2, al, delete_answer, d, 0);
+}
+
+/* the member (or .. row, e[n]) at x, y in the window; -1 none */
+static int aw_row_at(AWIN *w, int x, int y)
+{
+    GRECT wk;
+    int vr;
+    if (!w || !w->vis)
+        return -1;
+    wind_get_grect(w->handle, WF_WORKXYWH, &wk);
+    if (x < wk.g_x || x >= wk.g_x + wk.g_w || y < wk.g_y + cell_h + 4 || y >= wk.g_y + wk.g_h)
+        return -1;
+    vr = (int)w->top + (y - wk.g_y - cell_h - 4) / cell_h;
+    return vr >= 0 && vr < w->nv ? w->vis[vr] : -1;
+}
+
+/* Cut, then Paste in another folder of the same archive: the members
+   (full names, from the folder strip) get new names in the folder dir */
+static void move_names(AWIN *w, char **names, int n, const char *strip, const char *dir)
+{
+    char list[256], nw[300];
+    FILE *f;
+    int i, k, nn = 0;
+    size_t dl = strlen(dir), sl = strlen(strip);
+    if (w->busy || w->fmt == AF_GZ || w->fmt == AF_ARC)
+        return;
+    /* not into a folder that is being moved */
+    for (i = 0; i < n; i++) {
+        size_t ml = strlen(names[i]);
+        if (sl < ml && !strncmp(dir, names[i], ml) && (!dir[ml] || dir[ml] == '/')) {
+            alertf("[1][A folder can't go|into itself.][ OK ]");
+            return;
+        }
+    }
+    if (!(f = list_file(list, "w")))
+        return;
+    for (i = 0; i < n; i++) {
+        const char *r = rel_to(names[i], strip);
+        if (dl)
+            sprintf(nw, "%.200s/%.90s", dir, r);
+        else
+            sprintf(nw, "%.250s", r);
+        for (k = 0; k < w->n; k++)
+            if (!(w->e[k].flags & MF_DIR) && lc_same(w->e[k].name, nw))
+                break;
+        if (k < w->n) {
+            fclose(f);
+            Fdelete(list);
+            alertf("[1][%.30s|is in that folder already.][ OK ]", mbase(nw));
+            return;
+        }
+        fprintf(f, "%s\t%s\n", names[i], nw);
+        nn++;
+    }
+    fclose(f);
+    if (!nn) {
+        Fdelete(list);
+        return;
+    }
+    log_add("Moving %d member%s to /%s in %s", nn, nn == 1 ? "" : "s", dir, base_name(w->path));
+    clip_clear();
+    queue_rename(w, list, nn);
+}
+
+/* the selection dragged onto a folder's row (or ..) in its own window:
+   moved into that folder - new names, straight in the archive       */
+static void move_into(AWIN *w, int row)
+{
+    char dir[256], list[256], nw[300];
+    FILE *f;
+    int i, k, n = 0;
+    if (row < 0 || row > w->n || !(w->e[row].flags & MF_DIR) || w->e[row].sel || w->busy)
+        return;
+    if (w->fmt == AF_GZ || w->fmt == AF_ARC) {
+        alertf("[1][%s archives have|no folders.][ OK ]", af_name(w->fmt));
+        return;
+    }
+    row_folder(w, row, dir);
+    if (!(f = list_file(list, "w")))
+        return;
+    for (i = 0; i < w->n; i++) {
+        const char *m = w->e[i].name;
+        size_t ml = strlen(m);
+        if (!w->e[i].sel || in_folder(m, dir))
+            continue;
+        if ((w->e[i].flags & MF_DIR) && !strncmp(dir, m, ml) && (!dir[ml] || dir[ml] == '/')) {
+            fclose(f);
+            Fdelete(list);
+            alertf("[1][A folder can't go|into itself.][ OK ]");
+            return;
+        }
+        if (dir[0])
+            sprintf(nw, "%.200s/%.50s", dir, mbase(m));
+        else
+            sprintf(nw, "%.250s", mbase(m));
+        for (k = 0; k < w->n; k++)
+            if (lc_same(w->e[k].name, nw))
+                break;
+        if (k < w->n) {
+            fclose(f);
+            Fdelete(list);
+            alertf("[1][%.30s|is in that folder already.][ OK ]", mbase(m));
+            return;
+        }
+        fprintf(f, "%s\t%s\n", m, nw);
+        n++;
+    }
+    fclose(f);
+    if (!n) {
+        Fdelete(list);
+        return;
+    }
+    log_add("Moving %d item%s into /%s in %s", n, n == 1 ? "" : "s", dir, base_name(w->path));
+    queue_rename(w, list, n);
 }
 
 /* Pressed on a selected member: if the mouse moves with the button held,
@@ -4333,14 +4777,125 @@ static int aw_drag(AWIN *w, int mx, int my)
                 to = &aw[i];
     }
     if (to && to != w)
-        copy_ask(w, to);
+        copy_ask(w, to, aw_row_at(to, x, y));
+    else if (to == w)
+        move_into(w, aw_row_at(w, x, y));
     return 1;
+}
+
+/* the folder view shows dir ("" the top) */
+static void aw_go(AWIN *w, const char *dir)
+{
+    char was[256];
+    int i;
+    strcpy(was, w->cwd);
+    sprintf(w->cwd, "%.250s", dir);
+    w->flat = 0;
+    w->filt[0] = 0;
+    for (i = 0; i < w->n; i++)
+        w->e[i].sel = 0;
+    w->top = 0;
+    w->cur = w->anchor = -1;
+    aw_refilter(w);
+    /* up: the folder it came from is the one selected */
+    if (strlen(was) > strlen(w->cwd) && (!w->cwd[0] || !strncmp(was, w->cwd, strlen(w->cwd)))) {
+        char sub[256];
+        const char *r = rel_to(was, w->cwd), *sl = strchr(r, '/');
+        size_t l = (size_t)(r - was) + (sl ? (size_t)(sl - r) : strlen(r));
+        memcpy(sub, was, l);
+        sub[l] = 0;
+        if ((i = aw_find_folder(w, sub)) >= 0 && w->rowof[i] >= 0) {
+            w->e[i].sel = 1;
+            w->cur = i;
+            aw_show_row(w, i);
+        }
+    }
+    aw_changed(w);
+}
+
+/* up a folder (from the one list: back to the folder view) */
+static void aw_up(AWIN *w)
+{
+    char d[256];
+    if (!w || w->busy || w->isnew)
+        return;
+    strcpy(d, w->cwd);
+    if (!aw_flat(w))
+        d[parent_len(d)] = 0;
+    if (strcmp(d, w->cwd) || aw_flat(w))
+        aw_go(w, d);
+}
+
+/* double click or Return: into a folder, up, or a file extracted */
+static void aw_open_row(AWIN *w, int row)
+{
+    int i;
+    if (!w || w->busy || row < 0 || row > w->n || !w->e)
+        return;
+    if (w->e[row].flags & MF_UP)
+        aw_up(w);
+    else if (w->e[row].flags & MF_DIR)
+        aw_go(w, w->e[row].name);
+    else if (!(w->e[row].flags & MF_UNS)) {
+        for (i = 0; i < w->n; i++)
+            w->e[i].sel = i == row;
+        aw_changed(w);
+        queue_extract(w->path, w, 1);
+        begin();
+    }
+}
+
+/* the selection before a change (one flag a member), to draw only the rows
+   that changed afterwards; 0 if there's no memory (then all of it) */
+static u8 *aw_sel_snapshot(AWIN *w)
+{
+    u8 *b = w->e ? (u8 *)malloc(w->n + 1) : 0;
+    int i;
+    for (i = 0; b && i < w->n; i++)
+        b[i] = w->e[i].sel;
+    return b;
+}
+
+/* after a selection change: the rows that changed are drawn again, not the
+   window (unless it scrolled), the info line and the menus follow */
+static void aw_sel_done(AWIN *w, u8 *before, long oldtop)
+{
+    GRECT wk, r;
+    int i, vis, y0;
+    if (w->e)
+        w->e[w->n].sel = 0;                  /* the ".." row isn't selected */
+    if (!before || w->top != oldtop || !w->vis) {
+        free(before);
+        aw_changed(w);
+        return;
+    }
+    wind_get_grect(w->handle, WF_WORKXYWH, &wk);
+    vis = aw_rows(w);
+    y0 = wk.g_y + 2 + cell_h + 4;
+    for (i = (int)w->top; i < w->nv && i < w->top + vis + 1; i++) {
+        int m = w->vis[i];
+        if (m >= w->n || w->e[m].sel == before[m])
+            continue;
+        r.g_x = wk.g_x;
+        r.g_y = y0 + (i - (int)w->top) * cell_h - 1;
+        r.g_w = wk.g_w;
+        r.g_h = cell_h;
+        if (r.g_y + r.g_h > wk.g_y + wk.g_h)
+            r.g_h = wk.g_y + wk.g_h - r.g_y;
+        if (r.g_h > 0)
+            aw_redraw(w, &r);
+    }
+    free(before);
+    aw_set_info(w);
+    fa_menu_update();
 }
 
 static void aw_click(AWIN *w, int mx, int my, int clicks, int ks)
 {
     GRECT wk;
     int row, i, vr;
+    u8 *before;
+    long oldtop = w->top;
     wind_get_grect(w->handle, WF_WORKXYWH, &wk);
     if (my < wk.g_y + cell_h + 4) {
         wind_set(w->handle, WF_TOP, 0, 0, 0, 0);
@@ -4353,11 +4908,24 @@ static void aw_click(AWIN *w, int mx, int my, int clicks, int ks)
         return;
     }
     row = w->vis[vr];                        /* the member on that row */
+    if (row == w->n) {                       /* .. : up a folder */
+        if (clicks >= 2)
+            aw_up(w);
+        else {
+            before = aw_sel_snapshot(w);
+            for (i = 0; i < w->n; i++)
+                w->e[i].sel = 0;
+            w->cur = w->anchor = row;
+            aw_sel_done(w, before, oldtop);
+        }
+        return;
+    }
     /* a press on a selected member, nothing held: maybe a drag to another
        archive window (the selection stays as it is) */
     if (clicks == 1 && !(ks & (K_LSHIFT | K_RSHIFT | K_CTRL)) && w->e[row].sel &&
         aw_drag(w, mx, my))
         return;
+    before = aw_sel_snapshot(w);
     if ((ks & K_CTRL) && w->anchor >= 0 && w->anchor < w->n && w->rowof[w->anchor] >= 0) {
         int ra = w->rowof[w->anchor];
         int a = ra < vr ? ra : vr, b = ra < vr ? vr : ra;
@@ -4373,13 +4941,9 @@ static void aw_click(AWIN *w, int mx, int my, int clicks, int ks)
     if (!(ks & K_CTRL))
         w->anchor = row;
     w->cur = row;
-    aw_changed(w);
-    if (clicks >= 2 && !(w->e[row].flags & 2)) {
-        for (i = 0; i < w->n; i++)
-            w->e[i].sel = i == row;
-        queue_extract(w->path, w, 1);
-        begin();
-    }
+    aw_sel_done(w, before, oldtop);
+    if (clicks >= 2)
+        aw_open_row(w, row);
 }
 
 static void button(int mx, int my, int clicks, int ks)
@@ -4393,10 +4957,15 @@ static void button(int mx, int my, int clicks, int ks)
         return;
     }
     if (pdlg > 0 && h == pdlg) {
+        int o;
         dlg_place();
-        if (objc_find(ptree, 0, 8, mx, my) == P_BTN && !(ptree[P_BTN].ob_state & SELECTED))
+        o = objc_find(ptree, 0, 8, mx, my);
+        if (o == P_BTN && !(ptree[P_BTN].ob_state & SELECTED))
             dlg_button();
-        else
+        else if (o == P_LOG && finished) {
+            done_close();
+            show_log();                      /* the main window: the log */
+        } else
             wind_set(pdlg, WF_TOP, 0, 0, 0, 0);
         return;
     }
@@ -4417,10 +4986,12 @@ static void button(int mx, int my, int clicks, int ks)
 static int aw_cursor(AWIN *w, int ks, int scan)
 {
     int i, to, from, a, b, page, ra;
+    long oldtop;
+    u8 *before;
     if (!w || w->busy || w->nv <= 0 || !w->vis)
         return 0;
     page = aw_rows(w) > 1 ? aw_rows(w) - 1 : 1;
-    from = w->cur >= 0 && w->cur < w->n ? w->rowof[w->cur] : -1;
+    from = w->cur >= 0 && w->cur <= w->n ? w->rowof[w->cur] : -1;
     switch (scan) {
     case 0x48: to = from < 0 ? w->nv - 1 : from - 1; break;      /* up      */
     case 0x50: to = from < 0 ? 0 : from + 1; break;               /* down    */
@@ -4430,10 +5001,12 @@ static int aw_cursor(AWIN *w, int ks, int scan)
     case 0x4F: to = w->nv - 1; break;                             /* end     */
     default: return 0;
     }
+    oldtop = w->top;
+    before = aw_sel_snapshot(w);
     if (to < 0) to = 0;
     if (to >= w->nv) to = w->nv - 1;
     if (ks & (K_LSHIFT | K_RSHIFT)) {
-        ra = w->anchor >= 0 && w->anchor < w->n ? w->rowof[w->anchor] : -1;
+        ra = w->anchor >= 0 && w->anchor <= w->n ? w->rowof[w->anchor] : -1;
         if (ra < 0) {
             ra = from >= 0 ? from : to;
             w->anchor = w->vis[ra];
@@ -4456,7 +5029,7 @@ static int aw_cursor(AWIN *w, int ks, int scan)
         aw_show_row(w, w->vis[to]);          /* (it sets the anchor) */
         w->anchor = keep;
     }
-    aw_changed(w);
+    aw_sel_done(w, before, oldtop);
     return 1;
 }
 
@@ -4476,6 +5049,10 @@ static void key(int ks, int k)
     else if (c == 22) edit_paste();          /* ^V */
     else if (c == 18) do_rename();           /* ^R */
     else if (c == 12) do_filter(top_awin()); /* ^L */
+    else if (c == 2) toggle_flat(top_awin());        /* ^B */
+    else if (c == 16) list_contents(top_awin());     /* ^P */
+    else if (c == 13) { AWIN *w = top_awin(); if (w) aw_open_row(w, w->cur); }   /* Return */
+    else if (c == 8) aw_up(top_awin());      /* Backspace: up a folder */
     else if (((k >> 8) & 0xFF) == 0x53 || c == 0x7F) do_delete();     /* Delete */
     else if (c == 25) do_extract_all();      /* ^Y */
     else if (c == 6) do_find(top_awin());    /* ^F */

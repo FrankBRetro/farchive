@@ -40,20 +40,22 @@
 #define MI_FIND        40
 #define MI_FNEXT       41
 #define MI_FILTER      42
-#define MI_CHECK83     43
-#define MI_FIX83       44
-#define MI_ADD         46
-#define MI_CLOSE       48
-#define MB_4           49
-#define MI_XDROP       50
-#define MI_FOLDER      51
-#define MI_PATHS       52
-#define MI_REPLACE     53
-#define MI_SUBDIRS     54
-#define MI_83          55
-#define MI_NOMAC       56
-#define MI_CONFIRM     57
-#define MENU_NOBJ      58
+#define MI_FLAT        43
+#define MI_LIST        44
+#define MI_CHECK83     45
+#define MI_FIX83       46
+#define MI_ADD         48
+#define MI_CLOSE       50
+#define MB_4           51
+#define MI_XDROP       52
+#define MI_FOLDER      53
+#define MI_PATHS       54
+#define MI_REPLACE     55
+#define MI_SUBDIRS     56
+#define MI_83          57
+#define MI_NOMAC       58
+#define MI_CONFIRM     59
+#define MENU_NOBJ      60
 
 /* ABOUT */
 #define AB_ROOT        0
@@ -124,7 +126,8 @@
 #define P_FBAR         6
 #define P_STAT         7
 #define P_BTN          8
-#define FPROGRESS_NOBJ 9
+#define P_LOG          9
+#define FPROGRESS_NOBJ 10
 
 #define ICON_NOBJ      2
 

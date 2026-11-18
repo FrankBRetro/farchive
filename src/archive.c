@@ -85,6 +85,39 @@ static int lc_ncmp(const char *a, const char *b, size_t n)
     return 0;
 }
 
+/* renaming: the new name of a member, or of one in a folder being renamed */
+const char *ar_newname(const AOPT *o, const char *name, char *buf)
+{
+    int i, best = -1;
+    size_t bn = 0;
+    if (!o)
+        return 0;
+    /* the longest that fits: a file's own line before its folder's */
+    for (i = 0; i < o->nrn; i++) {
+        const char *f = o->rnfrom[i];
+        size_t n = strlen(f);
+        while (n && f[n - 1] == '/')
+            n--;
+        if (!n || n <= bn || strncmp(name, f, n) || (name[n] && name[n] != '/'))
+            continue;
+        best = i;
+        bn = n;
+    }
+    if (best < 0) 
+        return 0;
+    {
+        const char *t = o->rnto[best];
+        size_t tn = strlen(t);
+        while (tn && t[tn - 1] == '/')
+            tn--;
+        if (!tn || tn + strlen(name + bn) > 250)
+            return 0;
+        memcpy(buf, t, tn);
+        strcpy(buf + tn, name + bn);
+    }
+    return strcmp(buf, name) ? buf : 0;
+}
+
 static int ext_is(const char *path, const char *ext)
 {
     size_t n = strlen(path), m = strlen(ext);
@@ -271,8 +304,9 @@ int af_detect(const char *path)
             bout_flush(&out);
             if (pk.n >= 512 && tar_header_ok(pk.b))
                 fmt = AF_TGZ;
-            else if (pk.n == 0 && (ext_is(path, "tgz") || ext_is(path, "tar.gz")))
-                fmt = AF_TGZ;
+            else if ((pk.n == 0 || (pk.n >= 512 && !pk.b[0] && !memcmp(pk.b, pk.b + 1, 511))) &&
+                     (ext_is(path, "tgz") || ext_is(path, "tar.gz")))
+                fmt = AF_TGZ;                /* an empty one: just the end blocks */
         }
     } else if (n >= 21 && h[2] == '-' && h[3] == 'l' && h[6] == '-' && h[20] <= 3)
         fmt = AF_LHA;
@@ -286,6 +320,8 @@ int af_detect(const char *path)
         fmt = AF_TAR;
     else if (n == 0 || (n >= 512 && !h[0] && !memcmp(h, h + 1, 511)))
         fmt = af_from_name(path) == AF_TAR ? AF_TAR : AF_NONE;
+    else if (n == 1 && !h[0] && af_from_name(path) == AF_LHA)
+        fmt = AF_LHA;                        /* an empty LHA: its end byte */
     fclose(f);
     return fmt;
 }
@@ -802,6 +838,17 @@ static void part_name(XCTX *x, const char *dir, const char *part, int isdir, cha
     }
 }
 
+/* a member's name with o->strip (the folder being looked at) left off */
+static const char *x_rel(const AOPT *o, const char *name)
+{
+    size_t n = o->strip ? strlen(o->strip) : 0;
+    while (n && o->strip[n - 1] == '/')
+        n--;
+    if (n && !strncmp(name, o->strip, n) && name[n] == '/' && name[n + 1])
+        return name + n + 1;
+    return name;
+}
+
 /* where member e goes; 0 OK, 1 skip it */
 static int dest_path(XCTX *x, const AENT *e, char *out)
 {
@@ -809,7 +856,7 @@ static int dest_path(XCTX *x, const AENT *e, char *out)
     char *p, *q, *last = 0;
     int k, n = 0;
     char *list[64];
-    strcpy(parts, e->name);
+    strcpy(parts, x_rel(x->o, e->name));
     for (p = parts; *p; p++)
         if (*p == '\\')
             *p = '/';
@@ -925,7 +972,7 @@ static int x_open(XCTX *x, AENT *e)
         for (p = rel; *p; p++)
             if (*p == '\\')
                 *p = '/';
-        fprintf(x->o->mapw, "%s\t%s\n", rel, e->name);
+        fprintf(x->o->mapw, "%s\t%s\n", rel, x_rel(x->o, e->name));
     }
     x->crc32 = 0xFFFFFFFFUL;
     x->crc16 = 0;
@@ -1374,8 +1421,13 @@ int aw_pack(AW *w, AITEM *it, int *method, int may_store,
             e = E_WRITE;
         *csize = out.count;
     }
-    if (!e && in.total != it->size)
-        e = E_FORMAT;                  /* the file changed under us */
+    if (!e && in.total != it->size) {
+        /* it changed while it was read (a log being written, say): it goes
+           in as it was read, with that size - the rest of the archive
+           isn't lost over it */
+        ar_log(w->o, "%s changed while it was added: %ld bytes, as read", it->name, (long)in.total);
+        it->size = in.total;
+    }
     fclose(s.f);
     if (!it->size)
         *method = CM_STORE;
@@ -1560,7 +1612,11 @@ static int tc_begin(void *ctx, AENT *e)
             c->keep = 0;
     if (!c->keep)
         return 0;
-    strcpy(nm, e->name);
+    {
+        char nb[260];
+        const char *nn = ar_newname(c->w->o, e->name, nb);
+        strcpy(nm, nn ? nn : e->name);
+    }
     if (e->dir)
         strcat(nm, "/");
     c->err = tar_hdr(c->w, nm, e->dir ? '5' : e->rmeth ? e->rmeth : '0',
@@ -1671,11 +1727,35 @@ static const char *map_name(const char *name)
     return name;
 }
 
+/* FArchive's own temporary files (its list files, a rewrite's FARC$$$$.TMP
+   and .OLD, a copy's map): never added, even with the folder they are in */
+static int own_temp(const char *name)
+{
+    const char *b = ar_base(name), *dot = strrchr(b, '.');
+    if (lc_ncmp(b, "FARC", 4) || !dot || strlen(dot) != 4)
+        return 0;
+    return lc_eq(dot, ".LST") || lc_eq(dot, ".MAP") || lc_eq(dot, ".TMP") || lc_eq(dot, ".OLD");
+}
+
 static int il_push(ILIST *l, const char *path, const char *name, int dir, long size, u32 dt)
 {
     AITEM *t;
+    char in[300];
+    if (!dir && own_temp(path))
+        return E_OK;
     if (map_n)
         name = map_name(name);
+    if (l->o && l->o->into && l->o->into[0]) {     /* into a folder in the archive */
+        size_t n = strlen(l->o->into);
+        while (n && l->o->into[n - 1] == '/')
+            n--;
+        if (n + strlen(name) + 2 < 256) {
+            memcpy(in, l->o->into, n);
+            in[n] = '/';
+            strcpy(in + n + 1, name);
+            name = in;
+        }
+    }
     if (l->n == l->cap) {
         int nc = l->cap ? l->cap * 2 : 64;
         AITEM *ni = realloc(l->it, nc * sizeof(AITEM));
@@ -1774,6 +1854,93 @@ static int fmt_has_dirs(int fmt)
     return fmt == AF_ZIP || fmt == AF_TAR || fmt == AF_TGZ;
 }
 
+/* a member's name once the renaming is done (ARC: flat, 8.3, capitals) */
+static void final_name(const AOPT *o, int fmt, const char *name, char *out)
+{
+    char nb[260];
+    const char *nn = ar_newname(o, name, nb);
+    if (fmt == AF_ARC && nn)
+        name83(nn, out, 1);
+    else
+        strcpy(out, nn ? nn : name);
+}
+
+/* a temporary file next to path */
+static void tmp_beside(const char *path, char *tmp)
+{
+    char *b;
+    strcpy(tmp, path);
+    b = (char *)ar_base(tmp);
+    strcpy(b, "FARC$$$$.TMP");
+    if (b == tmp && strchr(path, ASEP) == 0 && strchr(path, '/') == 0)
+        strcpy(tmp, "FARC$$$$.TMP");
+}
+
+/* tmp takes path's place: the old one steps aside first */
+static int swap_in(const char *tmp, const char *path, AOPT *o)
+{
+    char bak[300];
+    strcpy(bak, tmp);
+    strcpy(bak + strlen(bak) - 3, "OLD");
+    remove(bak);
+    if (afs_rename(path, bak) != E_OK) {
+        ar_log(o, "Cannot replace %s", path);
+        remove(tmp);
+        return E_WRITE;
+    }
+    if (afs_rename(tmp, path) != E_OK) {
+        ar_log(o, "Cannot rename %s to %s", tmp, path);
+        afs_rename(bak, path);
+        return E_WRITE;
+    }
+    remove(bak);
+    return E_OK;
+}
+
+/* a GZ file's one member: a new name in its header, the rest copied */
+static int gz_rename(const char *path, const ARCH *a, AOPT *o)
+{
+    char nb[260], tmp[300];
+    const char *nn;
+    u8 h[10], buf[2048];
+    FILE *f, *t;
+    size_t n;
+    int err = E_OK;
+    if (a->n != 1 || !(nn = ar_newname(o, a->e[0].name, nb)))
+        return E_OK;
+    nn = ar_base(nn);
+    f = fopen(path, "rb");
+    if (!f)
+        return E_OPEN;
+    tmp_beside(path, tmp);
+    t = fopen(tmp, "wb");
+    if (!t) {
+        fclose(f);
+        ar_log(o, "Cannot write %s", tmp);
+        return E_WRITE;
+    }
+    if (fread(h, 1, 10, f) != 10)
+        err = E_FORMAT;
+    h[3] = 8;                          /* just the name: no extra, comment, header CRC */
+    if (!err && (fwrite(h, 1, 10, t) != 10 || fwrite(nn, 1, strlen(nn) + 1, t) != strlen(nn) + 1))
+        err = E_WRITE;
+    fseek(f, a->e[0].off, SEEK_SET);
+    while (!err && (n = fread(buf, 1, sizeof buf, f)) > 0)
+        if (fwrite(buf, 1, n, t) != n)
+            err = E_WRITE;
+    fclose(f);
+    if (fclose(t) != 0 && !err)
+        err = E_WRITE;
+    if (err) {
+        remove(tmp);
+        ar_log(o, "Could not write %s: %s", ar_base(path), fv_errstr(err));
+        return err;
+    }
+    ar_log(o, "Renamed %s to %s", a->e[0].name, nn);
+    o->nok++;
+    return swap_in(tmp, path, o);
+}
+
 int arch_add(const char *path, int fmt, char **files, int nfiles, AOPT *o)
 {
     ARCH old;
@@ -1847,6 +2014,10 @@ int arch_add(const char *path, int fmt, char **files, int nfiles, AOPT *o)
     }
     if (err)
         goto out;
+    if (fmt == AF_GZ && o->nrn && have_old && !nfiles) {
+        err = gz_rename(path, &old, o);
+        goto out;
+    }
     if (fmt == AF_GZ && o->ndel) {
         ar_log(o, "A GZ file holds one file: nothing can be deleted from it");
         err = E_UNSUP;
@@ -1937,8 +2108,45 @@ int arch_add(const char *path, int fmt, char **files, int nfiles, AOPT *o)
                 break;
             }
         }
-    } else if (o->ndel) {
-        ar_log(o, "%s: nothing to delete from", ar_base(path));
+        /* renaming: none may take a name another member has */
+        if (o->nrn) {
+            char **fin = calloc(old.n + 1, sizeof(char *));
+            u8 *ren = calloc(old.n + 1, 1);
+            int j;
+            for (k = 0; fin && ren && k < old.n; k++) {
+                char f1[260], nb[260];
+                ren[k] = ar_newname(o, old.e[k].name, nb) != 0;
+                final_name(o, fmt, old.e[k].name, f1);
+                if (!(fin[k] = malloc(strlen(f1) + 1)))
+                    break;
+                strcpy(fin[k], f1);
+            }
+            if (!fin || !ren || k < old.n)
+                err = E_NOMEM;
+            for (k = 0; k < old.n && !err; k++) {
+                if (!keep[k] || !ren[k])
+                    continue;
+                for (j = 0; j < old.n; j++)
+                    if (j != k && keep[j] && lc_eq(fin[k], fin[j]) &&
+                        !(old.e[k].dir && old.e[j].dir)) {
+                        ar_log(o, "Cannot rename %s: %s is in the archive already", old.e[k].name, fin[j]);
+                        err = E_UNSUP;
+                        break;
+                    }
+                if (!err) {
+                    ar_log(o, "Renamed %s to %s", old.e[k].name, fin[k]);
+                    o->nok++;
+                }
+            }
+            for (k = 0; fin && k < old.n; k++)
+                free(fin[k]);
+            free(fin);
+            free(ren);
+            if (err)
+                goto out;
+        }
+    } else if (o->ndel || o->nrn) {
+        ar_log(o, "%s: nothing to %s", ar_base(path), o->ndel ? "delete from" : "rename");
         err = E_OPEN;
         goto out;
     }

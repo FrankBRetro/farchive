@@ -6,7 +6,7 @@
 #include "fview.h"
 
 enum { OP_LOAD = 1, OP_RENDER, OP_CONVERT, OP_ARC_LIST, OP_ARC_EXTRACT, OP_ARC_ADD,
-       OP_ARC_DELETE };
+       OP_ARC_DELETE, OP_ARC_RENAME };
 enum { K_NONE = 0, K_IMAGE, K_TEXT, K_PDF, K_MAIN, K_ARCLIST };
 
 typedef struct {
@@ -46,6 +46,9 @@ typedef struct {
     char  map[256];              /* copying between archives: extracting
                                     writes "file<TAB>original name" here, adding
                                     reads it back (FAT renamed them to 8.3) */
+    char  strip[128];            /* extract: this folder in the archive left
+                                    off the members' paths                */
+    char  into[128];             /* add: into this folder in the archive  */
 } JOBREQ;
 enum { AJ_REPLACE = 1, AJ_RENAME83 = 2, AJ_SUBDIRS = 4, AJ_PATHS = 8, AJ_FAST = 16, AJ_BEST = 32,
        AJ_NOMAC = 64 };

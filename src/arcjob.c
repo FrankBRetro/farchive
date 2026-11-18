@@ -88,6 +88,8 @@ static void set_opts(AOPT *o, JOBREQ *q, PROG *pg)
     o->paths = (q->aflags & AJ_PATHS) != 0;
     o->nomac = (q->aflags & AJ_NOMAC) != 0;
     o->level = q->aflags & AJ_FAST ? 1 : q->aflags & AJ_BEST ? 3 : 2;
+    o->strip = q->strip[0] ? q->strip : 0;
+    o->into = q->into[0] ? q->into : 0;
     o->pg = pg;
 }
 
@@ -140,7 +142,7 @@ static int do_extract(JOBREQ *q, JOBRES *r, PROG *pg)
 static char **read_names(const char *path, int *pn)
 {
     FILE *f = fopen(path, "r");
-    char line[260], **files = 0;
+    char line[600], **files = 0;
     int n = 0, cap = 0;
     *pn = 0;
     if (!f)
@@ -209,6 +211,45 @@ static int do_add(JOBREQ *q, JOBRES *r, PROG *pg)
     return e;
 }
 
+/* q->list: "old<TAB>new" a line, members (or folders and all in them)
+   renamed in the archive's own headers; the packed data copied as is */
+static int do_rename(JOBREQ *q, JOBRES *r, PROG *pg)
+{
+    AOPT o;
+    char **lines;
+    int n, i, k = 0, e;
+    lines = read_names(q->list, &n);
+    if (!lines)
+        return E_OPEN;
+    set_opts(&o, q, pg);
+    o.rnfrom = malloc((n + 1) * sizeof(char *));
+    o.rnto = malloc((n + 1) * sizeof(char *));
+    if (!o.rnfrom || !o.rnto) {
+        free(o.rnfrom);
+        free(o.rnto);
+        free_names(lines, n);
+        return E_NOMEM;
+    }
+    for (i = 0; i < n; i++) {
+        char *t = strchr(lines[i], '\t');
+        if (!t || !t[1])
+            continue;
+        *t = 0;
+        o.rnfrom[k] = lines[i];
+        o.rnto[k++] = t + 1;
+    }
+    o.nrn = k;
+    e = k ? arch_add(q->path, q->afmt, 0, 0, &o) : E_OK;
+    r->acount[0] = o.nok;
+    r->acount[1] = o.nfail;
+    r->acount[2] = o.nskip;
+    r->acount[3] = 0;
+    free(o.rnfrom);
+    free(o.rnto);
+    free_names(lines, n);
+    return e;
+}
+
 int job_exec(JOBREQ *q, JOBRES *r, PROG *pg)
 {
     int e;
@@ -219,6 +260,7 @@ int job_exec(JOBREQ *q, JOBRES *r, PROG *pg)
     case OP_ARC_EXTRACT: e = do_extract(q, r, pg); break;
     case OP_ARC_ADD:     e = do_add(q, r, pg); break;
     case OP_ARC_DELETE:  e = do_add(q, r, pg); break;     /* a rewrite without them */
+    case OP_ARC_RENAME:  e = do_rename(q, r, pg); break;
     default:             e = E_UNSUP;
     }
     if (pg->cancelled)

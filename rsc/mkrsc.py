@@ -369,6 +369,8 @@ def fc_progress_tree(T):
     t.add(b, G_BOX, 0x00001171, 0, 0, 0, ch(0, 12), name='P_FBAR')
     t.add(root, G_STRING, '', 2, 7, 28, 1, name='P_STAT')
     t.add(root, G_BUTTON, T('b_cancel'), 31, 7, 11, 1, flags=SELECTABLE | EXIT | DEFAULT, name='P_BTN')
+    # shown beside OK only when something failed: opens the log
+    t.add(root, G_BUTTON, T('b_log'), 19, 7, 11, 1, flags=SELECTABLE | EXIT | HIDETREE, name='P_LOG')
     return t.finish()
 
 
@@ -495,7 +497,7 @@ FA_MENUS = (
          ('mi_rename', '^R'),
          ('-', ''), ('mi_selall', '^S'), ('mi_selnone', '^Z')],
         [('mi_xsel', '^T'), ('mi_xall', '^Y'), ('-', ''), ('mi_find', '^F'), ('mi_fnext', '^G'), ('mi_filter', '^L'),
-         ('mi_check83', '^K'), ('mi_fix83', '^J'), ('-', ''), ('mi_add', '^A'), ('-', ''), ('mi_close', '^U')],
+         ('mi_flat', '^B'), ('mi_list', '^P'), ('mi_check83', '^K'), ('mi_fix83', '^J'), ('-', ''), ('mi_add', '^A'), ('-', ''), ('mi_close', '^U')],
         [('mi_xdrop', ''), ('mi_folder', ''), ('mi_paths', ''), ('mi_replace', ''),
          ('mi_subdirs', ''), ('mi_83', ''), ('mi_nomac', ''), ('mi_confirm', '')],
     ])

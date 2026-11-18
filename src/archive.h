@@ -61,6 +61,11 @@ typedef struct {
     const char *mapr;                  /* adding: names back from such a file  */
     char **del;                        /* members to leave out (deleting); a  */
     int    ndel;                       /* folder's name takes what is in it   */
+    char **rnfrom, **rnto;             /* renaming: member (or folder and all */
+    int    nrn;                        /* in it) rnfrom[i] gets rnto[i]       */
+    const char *strip;                 /* extracting: this folder in the     */
+                                       /* archive left off the members' paths */
+    const char *into;                  /* adding: into this folder in it      */
     PROG  *pg;
     /* results */
     int    nok, nfail, nskip, nren;
@@ -76,8 +81,12 @@ int  arch_open_as(ARCH *a, const char *path, int fmt);  /* ... read as fmt (AF_N
 void arch_close(ARCH *a);
 /* extract the members with sel[i] set (sel 0: all) into dest */
 int  arch_extract(ARCH *a, const char *dest, const u8 *sel, AOPT *o);
-/* add files and folders to the archive (made if missing) */
+/* add files and folders to the archive (made if missing); with o->nrn
+   (and no files) members are renamed: the archive is rewritten with the
+   new names in its headers, the packed data copied as it is */
 int  arch_add(const char *path, int fmt, char **files, int nfiles, AOPT *o);
+/* the new name of a member being renamed (into buf), or 0: unchanged */
+const char *ar_newname(const AOPT *o, const char *name, char *buf);
 
 /* ------------------------------------------------- file system (arcfs.c) */
 

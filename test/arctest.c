@@ -2,6 +2,7 @@
  *   arctest l ARCHIVE
  *   arctest x ARCHIVE DEST [-8] [-n]     (-8: act as if DEST were FAT, -n: no paths)
  *   arctest a ARCHIVE FMT FILE...        (FMT zip lha zoo arc lzx tar tgz gz)
+ *   arctest r ARCHIVE OLD NEW [OLD NEW]  (rename members or folders)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,8 @@ int main(int argc, char **argv)
     memset(&o, 0, sizeof o);
     o.log = lg;
     o.replace = 1; o.rename83 = 1; o.subdirs = 1; o.paths = 1; o.level = getenv("LEVEL") ? atoi(getenv("LEVEL")) : 2;
+    o.into = getenv("INTO");
+    o.strip = getenv("STRIP");
     if (argc < 3) return 2;
     if (argv[1][0] == 'l') {
         e = arch_open(&a, argv[2]);
@@ -54,6 +57,19 @@ int main(int argc, char **argv)
         for (i = 1; i < 9; i++) if (!strcmp(argv[3], f[i])) fmt = i;
         e = arch_add(argv[2], fmt, argv + 4, argc - 4, &o);
         printf("add e=%d ok=%d fail=%d skip=%d\n", e, o.nok, o.nfail, o.nskip);
+        return e != 0;
+    }
+    if (argv[1][0] == 'r') {
+        int n = (argc - 3) / 2;
+        o.rnfrom = malloc(n * sizeof(char *));
+        o.rnto = malloc(n * sizeof(char *));
+        for (i = 0; i < n; i++) {
+            o.rnfrom[i] = argv[3 + 2 * i];
+            o.rnto[i] = argv[4 + 2 * i];
+        }
+        o.nrn = n;
+        e = arch_add(argv[2], AF_NONE, 0, 0, &o);
+        printf("rename e=%d ok=%d fail=%d skip=%d\n", e, o.nok, o.nfail, o.nskip);
         return e != 0;
     }
     return 2;

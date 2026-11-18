@@ -147,7 +147,9 @@ void tree_finish(OBJECT *t)
         OBJECT *o = &t[i];
         if (o->ob_type == G_BUTTON && aes_xbutton && (o->ob_flags & SELECTABLE) &&
             !(o->ob_flags & (EXIT | TOUCHEXIT | DEFAULT))) {
-            o->ob_state = (o->ob_state & 0x00FF) | WHITEBAK | 0xFF00;
+            /* WHITEBAK: on a white dialog only; on a 3D one (grey) the
+               button takes the dialog's background (FL3DBAK, tree_3d) */
+            o->ob_state = (o->ob_state & 0x00FF) | (aes_3d ? 0 : WHITEBAK) | 0xFF00;
             for (k = 1; k < n; k++)
                 if (t[k].ob_y / cell_h == o->ob_y / cell_h && t[k].ob_x > o->ob_x)
                     t[k].ob_x += cell_w + cell_w / 2;
@@ -174,7 +176,8 @@ void tree_finish(OBJECT *t)
  * 3D, in their own grey, if asked to:
  * - exit buttons: FL3DACT (they push in);
  * - on/off and radio buttons: FL3DIND (they light up), unless they are
- *   already the AES's own check boxes and round buttons;
+ *   already the AES's own check boxes and round buttons: those FL3DBAK,
+ *   on the dialog's background (not WHITEBAK, which is white);
  * - the dialog, its boxes and text: FL3DBAK, on a hollow white fill, which
  *   the AES then draws in its background colour;
  * - fields to type in stay white, as on the TOS 4 desktop.             */
@@ -189,6 +192,8 @@ static void tree_3d(OBJECT *t, int n)
                 o->ob_flags |= FL3DACT;
             else if ((o->ob_flags & SELECTABLE) && (o->ob_state & 0xFF00) != 0xFF00)
                 o->ob_flags |= FL3DIND;
+            else if (o->ob_flags & SELECTABLE)
+                o->ob_flags |= FL3DBAK;      /* the AES's check box / round button */
             break;
         case G_BOX: case G_IBOX: case G_BOXCHAR:
             o->ob_spec.index &= ~0x007FL;    /* hollow, white inside */

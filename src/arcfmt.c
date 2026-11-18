@@ -217,6 +217,8 @@ int zip_add(AW *w, AITEM *it)
 int zip_copy(AW *w, FILE *of, const AENT *e)
 {
     AENT n = *e;
+    char nb[260];
+    const char *nn;
     long len = e->off - e->hdr + e->csize;
     int err;
     if (e->rflags & 8) {               /* a data descriptor follows */
@@ -225,6 +227,26 @@ int zip_copy(AW *w, FILE *of, const AENT *e)
         len += fread(s, 1, 4, of) == 4 && g32(s) == 0x08074B50UL ? 16 : 12;
     }
     n.hdr = aw_tell(w);
+    if ((nn = ar_newname(w->o, e->name, nb)) != 0) {
+        /* a new name: the local header with it, the rest as it was */
+        u8 h[30];
+        size_t nl;
+        long onl;
+        fseek(of, e->hdr, SEEK_SET);
+        if (fread(h, 1, 30, of) != 30)
+            return E_FORMAT;
+        onl = (long)g16(h + 26);
+        strcpy(n.name, nn);
+        if (e->dir)
+            strcat(n.name, "/");
+        nl = strlen(n.name);
+        p16(h + 26, (unsigned)nl);
+        if ((err = aw_write(w, h, 30)) != E_OK || (err = aw_write(w, n.name, (long)nl)) != E_OK ||
+            (err = aw_copy(w, of, e->hdr + 30 + onl, len - 30 - onl)) != E_OK)
+            return err;
+        out_ent(w, &n);
+        return E_OK;
+    }
     if ((err = aw_copy(w, of, e->hdr, len)) != E_OK)
         return err;
     if (e->dir)
@@ -486,7 +508,42 @@ int lha_add(AW *w, AITEM *it)
 
 int lha_copy(AW *w, FILE *of, const AENT *e)
 {
-    return aw_copy(w, of, e->hdr, e->hlen + e->csize);
+    char nb[260];
+    const char *nn = ar_newname(w->o, e->name, nb);
+    u8 h[300], o22[22];
+    int nl, hs, i, err;
+    unsigned sum = 0;
+    if (!nn)
+        return aw_copy(w, of, e->hdr, e->hlen + e->csize);
+    /* a new name: a level 1 header with it (and no extended headers),
+       the method, sizes, CRC, time and attributes as they were */
+    fseek(of, e->hdr, SEEK_SET);
+    if (fread(o22, 1, 22, of) != 22)
+        return E_FORMAT;
+    nl = (int)strlen(nn);
+    if (nl > 230)
+        return E_FORMAT;
+    hs = 27 + nl;
+    memset(h, 0, sizeof h);
+    h[0] = (u8)(hs - 2);
+    memcpy(h + 2, o22 + 2, 5);
+    p32(h + 7, (u32)e->csize);
+    p32(h + 11, (u32)e->usize);
+    p16(h + 15, (unsigned)(e->dostime & 0xFFFF));
+    p16(h + 17, (unsigned)(e->dostime >> 16));
+    h[19] = e->attr ? e->attr : (u8)(e->dir ? 0x10 : 0x20);
+    h[20] = 1;
+    h[21] = (u8)nl;
+    for (i = 0; i < nl; i++)
+        h[22 + i] = (u8)(nn[i] == '/' ? '\\' : nn[i]);
+    p16(h + 22 + nl, (unsigned)e->crc);
+    h[24 + nl] = 'M';
+    for (i = 2; i < hs; i++)
+        sum += h[i];
+    h[1] = (u8)sum;
+    if ((err = aw_write(w, h, hs)) != E_OK)
+        return err;
+    return aw_copy(w, of, e->off, e->csize);
 }
 
 int lha_end(AW *w)
@@ -657,6 +714,7 @@ int zoo_add(AW *w, AITEM *it)
         return err;
     e.rmeth = (u16)(m == CM_ZOOLZW ? 1 : 0);
     e.crc = c16;
+    e.usize = it->size;                /* (aw_pack: as read, if it changed) */
     len = zoo_dir(d, it->name, &e, aw_tell(w), dpos);
     if ((err = aw_seekpatch(w, pos, d, len)) != E_OK)
         return err;
@@ -669,6 +727,8 @@ int zoo_add(AW *w, AITEM *it)
 int zoo_copy(AW *w, FILE *of, const AENT *e)
 {
     u8 d[56 + 600];
+    char nb[260];
+    const char *nn;
     long pos = aw_tell(w);
     int err, len = (int)e->hlen;
     if (len > (int)sizeof d)
@@ -676,10 +736,11 @@ int zoo_copy(AW *w, FILE *of, const AENT *e)
     fseek(of, e->hdr, SEEK_SET);
     if (fread(d, 1, len, of) != (size_t)len)
         return E_FORMAT;
-    if (len < 56) {                    /* type 1: make it a type 2 entry */
+    nn = ar_newname(w->o, e->name, nb);
+    if (len < 56 || nn) {              /* type 1, or a new name: a new type 2 entry */
         AENT n = *e;
         char nm[256];
-        strcpy(nm, e->name);
+        strcpy(nm, nn ? nn : e->name);
         len = zoo_dir(d, nm, &n, pos + 0, 0);
         len = zoo_dir(d, nm, &n, pos + len + e->csize, pos + len);
     } else {
@@ -815,10 +876,28 @@ int arcf_add(AW *w, AITEM *it)
 
 int arcf_copy(AW *w, FILE *of, const AENT *e)
 {
-    int err = aw_copy(w, of, e->hdr, e->hlen + e->csize);
-    if (!err)
-        out_ent(w, (AENT *)e);
-    return err;
+    char nb[260];
+    const char *nn = ar_newname(w->o, e->name, nb);
+    AENT n = *e;
+    u8 h[29];
+    int err, hl = (int)e->hlen;
+    if (!nn || hl > (int)sizeof h) {
+        err = aw_copy(w, of, e->hdr, e->hlen + e->csize);
+        if (!err)
+            out_ent(w, (AENT *)e);
+        return err;
+    }
+    /* a new name: ARC has a 13-byte field, flat 8.3 names */
+    fseek(of, e->hdr, SEEK_SET);
+    if (fread(h, 1, hl, of) != (size_t)hl)
+        return E_FORMAT;
+    name83(nn, n.name, 1);
+    memset(h + 2, 0, 13);
+    memcpy(h + 2, n.name, strlen(n.name));
+    if ((err = aw_write(w, h, hl)) != E_OK || (err = aw_copy(w, of, e->off, e->csize)) != E_OK)
+        return err;
+    out_ent(w, &n);
+    return E_OK;
 }
 
 int arcf_end(AW *w)
@@ -965,9 +1044,47 @@ int lzx_add(AW *w, AITEM *it)
 int lzx_copy(AW *w, FILE *of, const ARCH *a, int i, int n)
 {
     const AENT *f = &a->e[i], *l = &a->e[i + n - 1];
-    int k, err = aw_copy(w, of, f->hdr, l->off + l->csize - f->hdr);
-    for (k = 0; !err && k < n; k++)
-        out_ent(w, (AENT *)&a->e[i + k]);
+    char nb[260];
+    int k, err, any = 0;
+    for (k = 0; k < n && !any; k++)
+        any = ar_newname(w->o, a->e[i + k].name, nb) != 0;
+    if (!any) {
+        err = aw_copy(w, of, f->hdr, l->off + l->csize - f->hdr);
+        for (k = 0; !err && k < n; k++)
+            out_ent(w, (AENT *)&a->e[i + k]);
+        return err;
+    }
+    /* new names: each header again (a merged group's data follows its
+       last header), the header CRC worked out again */
+    for (k = 0, err = E_OK; k < n && !err; k++) {
+        const AENT *e = &a->e[i + k];
+        const char *nn = ar_newname(w->o, e->name, nb);
+        u8 h[31 + 255 + 256];
+        int hl = (int)e->hlen, onl, cl, nl;
+        AENT ne = *e;
+        if (hl < 31 || hl > (int)sizeof h - 255)
+            return E_FORMAT;
+        fseek(of, e->hdr, SEEK_SET);
+        if (fread(h, 1, hl, of) != (size_t)hl)
+            return E_FORMAT;
+        if (nn) {
+            onl = h[30];
+            cl = hl - 31 - onl;
+            nl = (int)strlen(nn);
+            if (nl > 255)
+                nl = 255;
+            memmove(h + 31 + nl, h + 31 + onl, cl);
+            memcpy(h + 31, nn, nl);
+            h[30] = (u8)nl;
+            hl = 31 + nl + cl;
+            lzx_hcrc(h, hl);
+            strcpy(ne.name, nn);
+        }
+        if ((err = aw_write(w, h, hl)) == E_OK && e->csize)
+            err = aw_copy(w, of, e->off, e->csize);
+        if (!err)
+            out_ent(w, &ne);
+    }
     return err;
 }
 
